@@ -52,3 +52,5 @@ Production credential setup, connecting real Microsoft accounts and deployment r
 This project is licensed under the **GNU Affero General Public License, version 3 only** (`AGPL-3.0-only`). See [LICENSE](LICENSE) for the full license text. The project does not grant an “or any later version” option.
 
 Third-party dependencies retain their own licenses and notices; see [third-party notices](THIRD_PARTY_NOTICES.md). Design lessons were drawn from [rust-email-mcp](https://github.com/black-zero358/rust-email-mcp); this implementation uses Graph-specific transport, synchronization and operation contracts.
+
+M1 review: [feature and acceptance coverage](docs/M1-COVERAGE.md), [hardening findings](docs/review-hardening.md), and [validation ledger](docs/validation.md).

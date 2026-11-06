@@ -1,6 +1,6 @@
 use crate::{
     Error, Result,
-    db::{Db, SearchQuery},
+    db::{Db, Operation, SearchQuery},
     graph::{GraphClient, segment},
     sync::Sync,
 };
@@ -195,10 +195,15 @@ pub fn catalog() -> Vec<rmcp::model::Tool> {
         );
     }
     for name in ["get_operation", "reconcile_operation"] {
+        let mut properties = json!({"account_id":string(),"operation_key":{"type":"string","minLength":8,"maxLength":128}});
+        if name == "reconcile_operation" {
+            properties["limit"] = json!({"type":"integer","minimum":1,"maximum":100});
+            properties["cursor"] = json!({"type":"string","maxLength":8192});
+        }
         add(
             name,
-            "Inspect durable write outcome. Reconciliation reads Graph only; uncertain creates return candidates for manual verification and are never automatically replayed.",
-            json!({"account_id":string(),"operation_key":string()}),
+            "Inspect durable write outcome. Large fields are summarized with _truncated=true; the durable record remains complete. Reconciliation reads Graph only; uncertain creates return one candidate page plus next_cursor for manual verification and are never automatically replayed.",
+            properties,
             &["account_id", "operation_key"],
             false,
             false,
@@ -239,8 +244,9 @@ pub fn validate(value: &Value, rule: &Value) -> bool {
                 && a.iter().all(|v| validate(v, &rule["items"]))
         }),
         Some("string") => value.as_str().is_some_and(|s| {
-            s.len() >= rule["minLength"].as_u64().unwrap_or(0) as usize
-                && s.len() <= rule["maxLength"].as_u64().unwrap_or(65536) as usize
+            let len = s.chars().count();
+            len >= rule["minLength"].as_u64().unwrap_or(0) as usize
+                && len <= rule["maxLength"].as_u64().unwrap_or(65536) as usize
         }),
         Some("integer") => value.as_i64().is_some_and(|n| {
             n >= rule["minimum"].as_i64().unwrap_or(i64::MIN)
@@ -327,7 +333,12 @@ impl Tools {
                     json!({"account_id":id,"list_id":list,field:items,"next_offset":next,"sync":self.db.sync_status(id)?}),
                 );
             }
-            "get_list" | "get_task" => return self.graph.get(id, &route(&a)?).await,
+            "get_list" | "get_task" => {
+                return self
+                    .graph
+                    .get_at_generation(id, account.generation, &route(&a)?)
+                    .await;
+            }
             "list_steps" | "list_linked_resources" => {
                 let suffix = if name == "list_steps" {
                     "checklistItems"
@@ -353,14 +364,36 @@ impl Tools {
                 } else {
                     format!("{expected}?$top={limit}")
                 };
-                let page = self.graph.get(id, &path).await?;
+                let page = self
+                    .graph
+                    .get_at_generation(id, account.generation, &path)
+                    .await?;
                 let items = page["value"].as_array().ok_or_else(|| {
                     Error::new("invalid_graph_response", "Expected a collection page")
                 })?;
-                return Ok(json!({"items":items,"next_cursor":page.get("@odata.nextLink")}));
+                if items.len() > 1000 {
+                    return Err(Error::new(
+                        "graph_response",
+                        "Graph returned too many items in one page; request a smaller limit",
+                    ));
+                }
+                let next = validated_next_cursor(
+                    &self.graph,
+                    &page,
+                    &self.graph.validate_url(&expected)?,
+                )?;
+                let items: Vec<_> = items
+                    .iter()
+                    .map(|v| bounded_value(v, 96 * 1024 / items.len().max(1)))
+                    .collect();
+                return Ok(json!({"items":items,"next_cursor":next}));
             }
-            "get_operation" => return Ok(json!(self.db.operation(id, arg(&a, "operation_key")?)?)),
-            "reconcile_operation" => return self.reconcile(id, arg(&a, "operation_key")?).await,
+            "get_operation" => {
+                return Ok(operation_view(
+                    &self.db.operation(id, arg(&a, "operation_key")?)?,
+                ));
+            }
+            "reconcile_operation" => return self.reconcile(id, &a).await,
             _ => {}
         }
         let (method, path, body) = self.intent(name, &a).await?;
@@ -374,11 +407,14 @@ impl Tools {
             &request,
         )?;
         if !operation.created {
-            return Ok(json!({"operation":operation}));
+            return Ok(json!({"operation":operation_view(&operation)}));
         }
         let outcome = async {
             if matches!(name, "update_list" | "delete_list") {
-                let list = self.graph.get(id, &path).await?;
+                let list = self
+                    .graph
+                    .get_at_generation(id, account.generation, &path)
+                    .await?;
                 if list["wellknownListName"]
                     .as_str()
                     .is_some_and(|s| s != "none")
@@ -408,7 +444,7 @@ impl Tools {
                     Ok(v) => v,
                     Err(e) => json!({"error":e,"cache_may_be_stale":true}),
                 };
-                Ok(json!({"operation":self.db.operation(id,key)?,"sync":sync}))
+                Ok(json!({"operation":operation_view(&self.db.operation(id,key)?),"sync":sync}))
             }
             Err(e) => {
                 let state = if e.code == "write_unknown" {
@@ -423,7 +459,7 @@ impl Tools {
                     state,
                     &json!({"error":e}),
                 )?;
-                Ok(json!({"operation":self.db.operation(id,key)?}))
+                Ok(json!({"operation":operation_view(&self.db.operation(id,key)?)}))
             }
         }
     }
@@ -485,25 +521,57 @@ impl Tools {
         };
         Ok((method, path, body))
     }
-    async fn reconcile(&self, account: &str, key: &str) -> Result<Value> {
+    async fn reconcile(&self, account: &str, args: &Value) -> Result<Value> {
+        let key = arg(args, "operation_key")?;
         let generation = self.db.account(account)?.generation;
         let op = self.db.operation(account, key)?;
         if op.state != "unknown" {
-            return Ok(json!({"operation":op}));
+            return Ok(json!({"operation":operation_view(&op)}));
         }
         let path = arg(&op.request, "path")?;
         let method = arg(&op.request, "method")?;
         if method == "POST" {
-            let items = self.graph.collection(account, path).await?;
+            let limit = args["limit"].as_u64().unwrap_or(25) as usize;
+            let url = if let Some(cursor) = args["cursor"].as_str() {
+                let url = self.graph.validate_url(cursor)?;
+                if !same_collection_path(&url, &self.graph.validate_url(path)?) {
+                    return Err(Error::new(
+                        "invalid_input",
+                        "Continuation must belong to this operation's collection",
+                    ));
+                }
+                url
+            } else {
+                format!("{path}?$top={limit}")
+            };
+            let page = self
+                .graph
+                .get_at_generation(account, generation, &url)
+                .await?;
+            let items = page["value"]
+                .as_array()
+                .ok_or_else(|| Error::new("graph_response", "Expected a collection page"))?;
+            if items.len() > 1000 {
+                return Err(Error::new(
+                    "graph_response",
+                    "Graph returned too many items in one page; request a smaller limit",
+                ));
+            }
+            let next = validated_next_cursor(&self.graph, &page, &self.graph.validate_url(path)?)?;
             let candidates: Vec<_> = items
-                .into_iter()
-                .filter(|v| matches_patch(v, &op.request["body"]))
+                .iter()
+                .filter(|v| matches_create_candidate(v, &op.request["body"]))
+                .map(|v| bounded_value(v, 96 * 1024 / items.len().max(1)))
                 .collect();
             return Ok(
-                json!({"operation":op,"candidates":candidates,"requires_manual_verification":true,"instruction":"Inspect candidates before creating a new operation. This operation will not be replayed."}),
+                json!({"operation":operation_view(&op),"candidates":candidates,"next_cursor":next,"page_scanned":items.len(),"requires_manual_verification":true,"instruction":"Inspect every candidate page using next_cursor before deciding on a new operation. Candidates match the requested title/displayName; verify remaining fields and identity manually. This operation will not be replayed."}),
             );
         }
-        match self.graph.get(account, path).await {
+        match self
+            .graph
+            .get_at_generation(account, generation, path)
+            .await
+        {
             Ok(v) if method == "PATCH" && matches_patch(&v, &op.request["body"]) => {
                 self.db.operation_finish_at_generation(
                     account,
@@ -526,13 +594,110 @@ impl Tools {
             }
             Ok(v) => {
                 return Ok(
-                    json!({"operation":op,"observed":v,"requires_manual_verification":true}),
+                    json!({"operation":operation_view(&op),"observed":bounded_value(&v, 32 * 1024),"requires_manual_verification":true}),
                 );
             }
             Err(e) => return Err(e),
         }
-        Ok(json!({"operation":self.db.operation(account,key)?}))
+        Ok(json!({"operation":operation_view(&self.db.operation(account,key)?)}))
     }
+}
+// Operation records remain complete in SQLite. Bound their presentation separately
+// so the recovery tool itself cannot repeatedly exceed the MCP response envelope.
+fn operation_view(operation: &Operation) -> Value {
+    json!({
+        "operation_key":operation.operation_key,"state":operation.state,"created":operation.created,
+        "request":bounded_value(&operation.request, 32 * 1024),
+        "response":bounded_value(&operation.response, 32 * 1024)
+    })
+}
+fn bounded_value(value: &Value, budget: usize) -> Value {
+    if serde_json::to_vec(value).is_ok_and(|v| v.len() <= budget) {
+        return value.clone();
+    }
+    let mut summary = json!({"_truncated":true});
+    // Keep stable resource identity and useful outcome fields, never arbitrary
+    // upstream keys or unbounded body text. Each retained field shares the budget.
+    for key in [
+        "id",
+        "method",
+        "path",
+        "title",
+        "displayName",
+        "status",
+        "reconciled",
+        "deleted",
+        "code",
+        "message",
+        "body",
+        "resource",
+        "error",
+        "isChecked",
+        "importance",
+        "categories",
+        "dueDateTime",
+        "startDateTime",
+        "reminderDateTime",
+        "isReminderOn",
+        "recurrence",
+        "webUrl",
+        "applicationName",
+        "externalId",
+        "contentType",
+        "content",
+    ] {
+        if let Some(field) = value.get(key) {
+            let field = if field.is_object() && budget >= 2048 {
+                bounded_value(field, budget / 4)
+            } else {
+                field.clone()
+            };
+            let mut candidate = summary.clone();
+            candidate[key] = field;
+            if serde_json::to_vec(&candidate).is_ok_and(|v| v.len() <= budget) {
+                summary = candidate;
+            }
+        }
+    }
+    summary
+}
+fn same_collection_path(left: &str, right: &str) -> bool {
+    fn parts(url: &str) -> Option<Vec<String>> {
+        url::Url::parse(url)
+            .ok()?
+            .path_segments()?
+            .map(|p| {
+                percent_encoding::percent_decode_str(p)
+                    .decode_utf8()
+                    .ok()
+                    .map(|p| p.into_owned())
+            })
+            .collect()
+    }
+    match (parts(left), parts(right)) {
+        (Some(a), Some(b)) => a == b,
+        _ => false,
+    }
+}
+fn validated_next_cursor(
+    graph: &GraphClient,
+    page: &Value,
+    expected: &str,
+) -> Result<Option<String>> {
+    let Some(next) = page.get("@odata.nextLink") else {
+        return Ok(None);
+    };
+    let next = next
+        .as_str()
+        .ok_or_else(|| Error::new("graph_response", "Graph pagination link must be a string"))?;
+    let next = graph.validate_url(next)?;
+    if next.len() > 8192 || !same_collection_path(&next, expected) {
+        return Err(Error::new(
+            "graph_response",
+            "Graph continuation changed collection or exceeds cursor limit",
+        ));
+    }
+    Ok(Some(next))
 }
 fn collection_cursor_matches(url: &str, list: &str, task: &str, collection: &str) -> bool {
     let Ok(url) = url::Url::parse(url) else {
@@ -555,14 +720,26 @@ fn collection_cursor_matches(url: &str, list: &str, task: &str, collection: &str
             ]
     })
 }
+fn matches_create_candidate(value: &Value, request: &Value) -> bool {
+    // Graph may normalize HTML, dates, recurrence defaults, or array ordering.
+    // Candidate discovery is deliberately broad; it never resolves the ledger.
+    for field in ["title", "displayName"] {
+        if let Some(expected) = request.get(field) {
+            return value.get(field) == Some(expected);
+        }
+    }
+    matches_patch(value, request)
+}
 fn matches_patch(value: &Value, patch: &Value) -> bool {
     patch.as_object().is_some_and(|m| {
         m.iter().all(|(k, v)| {
-            if v.is_object() {
-                matches_patch(&value[k], v)
-            } else {
-                &value[k] == v
-            }
+            value.get(k).is_some_and(|observed| {
+                if v.is_object() {
+                    matches_patch(observed, v)
+                } else {
+                    observed == v
+                }
+            })
         })
     })
 }
@@ -649,6 +826,47 @@ mod tests {
         ));
     }
     #[test]
+    fn provider_continuations_are_validated_before_exposure() {
+        let graph = GraphClient::for_test("http://127.0.0.1:1234/v1.0/");
+        let expected = "http://127.0.0.1:1234/v1.0/me/todo/lists/list/tasks";
+        for bad in [
+            json!(false),
+            json!("https://evil.example/v1.0/me/todo/lists/list/tasks"),
+            json!("http://127.0.0.1:1234/v1.0/me/todo/lists/other/tasks"),
+        ] {
+            assert!(
+                validated_next_cursor(&graph, &json!({"@odata.nextLink":bad}), expected).is_err()
+            );
+        }
+        assert_eq!(
+            validated_next_cursor(&graph, &json!({}), expected).unwrap(),
+            None
+        );
+    }
+    #[test]
+    fn cleared_field_requires_explicit_observation() {
+        assert!(!matches_patch(
+            &json!({"id":"task"}),
+            &json!({"dueDateTime":null})
+        ));
+        assert!(matches_patch(
+            &json!({"dueDateTime":null}),
+            &json!({"dueDateTime":null})
+        ));
+    }
+    #[test]
+    fn create_candidates_survive_provider_normalization() {
+        let requested = json!({"title":"task","body":{"contentType":"html","content":"hello"},"dueDateTime":{"dateTime":"2026-11-06T00:00:00","timeZone":"UTC"}});
+        let observed = json!({"title":"task","body":{"contentType":"html","content":"<html><body>hello</body></html>"},"dueDateTime":{"dateTime":"2026-11-06T00:00:00.0000000","timeZone":"UTC"}});
+        assert!(matches_create_candidate(&observed, &requested));
+        assert!(!matches_patch(&observed, &requested));
+    }
+    #[test]
+    fn schema_string_lengths_count_unicode_characters() {
+        assert!(validate(&json!("中".repeat(1024)), &string()));
+        assert!(!validate(&json!("中".repeat(1025)), &string()));
+    }
+    #[test]
     fn strict_tool_contracts() {
         for t in catalog() {
             assert!(t.input_schema.contains_key("additionalProperties"));
@@ -715,6 +933,602 @@ mod lifecycle_tests {
     }
     fn input() -> Value {
         json!({"account_id":"a","operation_key":"test-key-1","list_id":"list","data":{"title":"中文"}})
+    }
+    #[tokio::test]
+    async fn large_recorded_outcome_has_bounded_recovery() {
+        let (tools, count, server, _dir) = fixture(StatusCode::CREATED).await;
+        let request = json!({"method":"POST","path":"/me/todo/lists/list/tasks","body":{"title":"中文","body":{"content":"&amp;".repeat(65536)}}});
+        tools
+            .db
+            .operation_claim("a", "large-key", "fingerprint", &request)
+            .unwrap();
+        let response = json!({"id":"created-task","body":{"content":"x".repeat(2*1024*1024)}});
+        tools
+            .db
+            .operation_finish("a", "large-key", "succeeded", &response)
+            .unwrap();
+        let value = tools
+            .call(
+                "get_operation",
+                json!({"account_id":"a","operation_key":"large-key"}),
+            )
+            .await
+            .unwrap();
+        assert!(serde_json::to_vec(&value).unwrap().len() < 128 * 1024);
+        assert_eq!(value["state"], "succeeded");
+        assert_eq!(value["response"]["id"], "created-task");
+        let envelope = json!({"jsonrpc":"2.0","id":"large-lookup","result":rmcp::model::CallToolResult::structured(json!({"data":value}))});
+        assert!(serde_json::to_vec(&envelope).unwrap().len() < 1024 * 1024);
+        assert_eq!(
+            tools.db.operation("a", "large-key").unwrap().response,
+            response
+        );
+        assert_eq!(count.load(Ordering::SeqCst), 0);
+        server.abort();
+    }
+    #[tokio::test]
+    async fn concurrent_same_key_submits_only_one_mutation() {
+        let (tools, count, server, _dir) = fixture(StatusCode::CREATED).await;
+        let (a, b) = tokio::join!(
+            tools.call("create_task", input()),
+            tools.call("create_task", input())
+        );
+        assert!(a.is_ok());
+        assert!(b.is_ok());
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            tools.db.operation("a", "test-key-1").unwrap().state,
+            "succeeded"
+        );
+        server.abort();
+    }
+    #[tokio::test]
+    async fn uncertain_create_reconciliation_is_paged_and_read_only() {
+        use axum::{extract::Query, http::HeaderMap};
+        use std::collections::HashMap;
+        let count = Arc::new(AtomicUsize::new(0));
+        async fn page(
+            State(n): State<Arc<AtomicUsize>>,
+            headers: HeaderMap,
+            Query(query): Query<HashMap<String, String>>,
+            method: Method,
+        ) -> Json<Value> {
+            let host = headers["host"].to_str().unwrap();
+            assert_eq!(method, Method::GET);
+            n.fetch_add(1, Ordering::SeqCst);
+            if query.contains_key("$skiptoken") {
+                Json(json!({"value":[{"id":"second","title":"中文"}]}))
+            } else {
+                assert_eq!(query["$top"], "1");
+                Json(
+                    json!({"value":[{"id":"first","title":"中文","large":"x".repeat(256*1024)}],"@odata.nextLink":format!("http://{host}/v1.0/me/todo/lists/list/tasks?$skiptoken=next")}),
+                )
+            }
+        }
+        let router = Router::new()
+            .route("/v1.0/me/todo/lists/list/tasks", any(page))
+            .with_state(count.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let root = format!("http://{}/v1.0/", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(Db::open(&dir.path().join("db")).unwrap());
+        db.upsert_account("a", "Test", "synthetic").unwrap();
+        let graph = Arc::new(GraphClient::for_test(&root));
+        let sync = Arc::new(Sync::new(db.clone(), graph.clone()));
+        let tools = Tools { db, graph, sync };
+        let request =
+            json!({"method":"POST","path":"/me/todo/lists/list/tasks","body":{"title":"中文"}});
+        tools
+            .db
+            .operation_claim("a", "unknown-key", "fingerprint", &request)
+            .unwrap();
+        tools
+            .db
+            .operation_finish("a", "unknown-key", "unknown", &Value::Null)
+            .unwrap();
+        let mut args = json!({"account_id":"a","operation_key":"unknown-key","limit":1});
+        let first = tools
+            .call("reconcile_operation", args.clone())
+            .await
+            .unwrap();
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        assert_eq!(first["candidates"][0]["id"], "first");
+        assert_eq!(first["candidates"][0]["_truncated"], true);
+        assert_eq!(first["operation"]["state"], "unknown");
+        assert!(serde_json::to_vec(&first).unwrap().len() < 128 * 1024);
+        args["cursor"] = first["next_cursor"].clone();
+        let second = tools
+            .call("reconcile_operation", args.clone())
+            .await
+            .unwrap();
+        assert_eq!(second["candidates"][0]["id"], "second");
+        assert!(second["next_cursor"].is_null());
+        args["cursor"] = json!(format!("{root}me/todo/lists/other/tasks"));
+        assert_eq!(
+            tools
+                .call("reconcile_operation", args)
+                .await
+                .unwrap_err()
+                .code,
+            "invalid_input"
+        );
+        assert_eq!(count.load(Ordering::SeqCst), 2);
+        server.abort();
+    }
+    // The synthetic provider commits first, then fails while streaming a 2xx
+    // response. This exercises transport loss after a real remote state change,
+    // rather than equating an upstream error status with a committed mutation.
+    #[derive(Default)]
+    struct LostResponseState {
+        resource: std::sync::Mutex<Option<Value>>,
+        writes: AtomicUsize,
+        reads: AtomicUsize,
+        aborted_responses: AtomicUsize,
+    }
+    async fn lost_response_fixture(
+        initial: Option<Value>,
+    ) -> (
+        Tools,
+        Arc<LostResponseState>,
+        tokio::task::JoinHandle<()>,
+        tempfile::TempDir,
+    ) {
+        use axum::{
+            body::{Body, Bytes},
+            http::Uri,
+            response::{IntoResponse, Response},
+        };
+        async fn handle(
+            State(state): State<Arc<LostResponseState>>,
+            method: Method,
+            uri: Uri,
+            bytes: Bytes,
+        ) -> Response {
+            assert!(uri.path().starts_with("/v1.0/me/todo/lists/list/tasks"));
+            if method == Method::GET {
+                state.reads.fetch_add(1, Ordering::SeqCst);
+                let resource = state.resource.lock().unwrap().clone();
+                return if uri.path().ends_with("/tasks") {
+                    Json(json!({"value":resource.into_iter().collect::<Vec<_>>()})).into_response()
+                } else if let Some(resource) = resource {
+                    Json(resource).into_response()
+                } else {
+                    StatusCode::NOT_FOUND.into_response()
+                };
+            }
+            state.writes.fetch_add(1, Ordering::SeqCst);
+            {
+                let mut remote = state.resource.lock().unwrap();
+                match method {
+                    Method::POST => {
+                        assert!(remote.is_none(), "duplicate create reached the provider");
+                        let mut resource: Value = serde_json::from_slice(&bytes).unwrap();
+                        resource["id"] = json!("remote-task");
+                        *remote = Some(resource);
+                    }
+                    Method::PATCH => {
+                        let patch: Value = serde_json::from_slice(&bytes).unwrap();
+                        let resource = remote.as_mut().expect("existing remote task");
+                        for (field, value) in patch.as_object().unwrap() {
+                            resource[field] = value.clone();
+                        }
+                    }
+                    Method::DELETE => {
+                        assert!(
+                            remote.take().is_some(),
+                            "duplicate delete reached the provider"
+                        );
+                    }
+                    _ => panic!("unexpected Graph method"),
+                }
+            }
+            let status = if method == Method::POST {
+                StatusCode::CREATED
+            } else {
+                StatusCode::OK
+            };
+            let stream = futures_util::stream::unfold((0, state), |(step, state)| async move {
+                match step {
+                    0 => Some((
+                        Ok::<_, std::io::Error>(Bytes::from_static(b"{\"id\":\"remote-task\",")),
+                        (1, state),
+                    )),
+                    1 => {
+                        // Yield after headers and a partial JSON chunk have been
+                        // flushed, then sever the response before its completion.
+                        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                        state.aborted_responses.fetch_add(1, Ordering::SeqCst);
+                        Some((
+                            Err(std::io::Error::new(
+                                std::io::ErrorKind::ConnectionReset,
+                                "synthetic response loss after commit",
+                            )),
+                            (2, state),
+                        ))
+                    }
+                    _ => None,
+                }
+            });
+            Response::builder()
+                .status(status)
+                .header("content-type", "application/json")
+                .body(Body::from_stream(stream))
+                .unwrap()
+        }
+        let state = Arc::new(LostResponseState {
+            resource: std::sync::Mutex::new(initial),
+            ..Default::default()
+        });
+        let router = Router::new()
+            .route("/{*path}", any(handle))
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let root = format!("http://{}/v1.0/", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(Db::open(&dir.path().join("db")).unwrap());
+        db.upsert_account("a", "Test", "synthetic").unwrap();
+        let graph = Arc::new(GraphClient::for_test(&root));
+        let sync = Arc::new(Sync::new(db.clone(), graph.clone()));
+        (Tools { db, graph, sync }, state, server, dir)
+    }
+    #[tokio::test]
+    async fn committed_create_with_lost_response_reconciles_candidate_without_replay() {
+        let (tools, remote, server, _dir) = lost_response_fixture(None).await;
+        let args = input();
+        let result = tools.call("create_task", args.clone()).await.unwrap();
+        assert_eq!(result["operation"]["state"], "unknown");
+        assert_eq!(
+            result["operation"]["response"]["error"]["code"],
+            "write_unknown"
+        );
+        assert_eq!(
+            remote.resource.lock().unwrap().as_ref().unwrap()["id"],
+            "remote-task"
+        );
+        assert_eq!(remote.aborted_responses.load(Ordering::SeqCst), 1);
+        assert_eq!(remote.writes.load(Ordering::SeqCst), 1);
+        assert_eq!(remote.reads.load(Ordering::SeqCst), 0);
+        let lookup = json!({"account_id":"a","operation_key":"test-key-1"});
+        let reconciled = tools.call("reconcile_operation", lookup).await.unwrap();
+        assert_eq!(reconciled["candidates"][0]["id"], "remote-task");
+        assert_eq!(reconciled["operation"]["state"], "unknown");
+        assert_eq!(reconciled["requires_manual_verification"], true);
+        assert!(reconciled["next_cursor"].is_null());
+        let replay = tools.call("create_task", args).await.unwrap();
+        assert_eq!(replay["operation"]["state"], "unknown");
+        assert_eq!(remote.writes.load(Ordering::SeqCst), 1);
+        assert_eq!(remote.reads.load(Ordering::SeqCst), 1);
+        server.abort();
+    }
+    #[tokio::test]
+    async fn committed_patch_with_lost_response_reconciles_explicit_null_without_replay() {
+        let initial = json!({"id":"remote-task","title":"before","dueDateTime":{"dateTime":"2026-11-06T12:00:00","timeZone":"UTC"}});
+        let (tools, remote, server, _dir) = lost_response_fixture(Some(initial)).await;
+        let args = json!({"account_id":"a","operation_key":"lost-patch-key","list_id":"list","task_id":"remote-task","data":{"title":"after","dueDateTime":null}});
+        let result = tools.call("update_task", args.clone()).await.unwrap();
+        assert_eq!(result["operation"]["state"], "unknown");
+        assert_eq!(remote.aborted_responses.load(Ordering::SeqCst), 1);
+        assert_eq!(remote.reads.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            remote
+                .resource
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .get("dueDateTime"),
+            Some(&Value::Null)
+        );
+        let lookup = json!({"account_id":"a","operation_key":"lost-patch-key"});
+        let reconciled = tools
+            .call("reconcile_operation", lookup.clone())
+            .await
+            .unwrap();
+        assert_eq!(reconciled["operation"]["state"], "succeeded");
+        assert_eq!(reconciled["operation"]["response"]["reconciled"], true);
+        assert_eq!(
+            reconciled["operation"]["response"]["resource"]["title"],
+            "after"
+        );
+        assert_eq!(
+            tools.call("get_operation", lookup).await.unwrap()["state"],
+            "succeeded"
+        );
+        assert_eq!(
+            tools.call("update_task", args).await.unwrap()["operation"]["state"],
+            "succeeded"
+        );
+        assert_eq!(remote.writes.load(Ordering::SeqCst), 1);
+        assert_eq!(remote.reads.load(Ordering::SeqCst), 1);
+        server.abort();
+    }
+    #[tokio::test]
+    async fn committed_delete_with_lost_response_reconciles_404_without_replay() {
+        let initial = json!({"id":"remote-task","title":"delete me"});
+        let (tools, remote, server, _dir) = lost_response_fixture(Some(initial)).await;
+        let args = json!({"account_id":"a","operation_key":"lost-delete-key","list_id":"list","task_id":"remote-task"});
+        let result = tools.call("delete_task", args.clone()).await.unwrap();
+        assert_eq!(result["operation"]["state"], "unknown");
+        assert!(remote.resource.lock().unwrap().is_none());
+        assert_eq!(remote.aborted_responses.load(Ordering::SeqCst), 1);
+        assert_eq!(remote.reads.load(Ordering::SeqCst), 0);
+        let lookup = json!({"account_id":"a","operation_key":"lost-delete-key"});
+        let reconciled = tools
+            .call("reconcile_operation", lookup.clone())
+            .await
+            .unwrap();
+        assert_eq!(reconciled["operation"]["state"], "succeeded");
+        assert_eq!(reconciled["operation"]["response"]["deleted"], true);
+        assert_eq!(reconciled["operation"]["response"]["reconciled"], true);
+        assert_eq!(
+            tools.call("get_operation", lookup).await.unwrap()["state"],
+            "succeeded"
+        );
+        assert_eq!(
+            tools.call("delete_task", args).await.unwrap()["operation"]["state"],
+            "succeeded"
+        );
+        assert_eq!(remote.writes.load(Ordering::SeqCst), 1);
+        assert_eq!(remote.reads.load(Ordering::SeqCst), 1);
+        server.abort();
+    }
+    #[tokio::test]
+    async fn all_mutation_tools_follow_http_contract_refresh_and_replay_safely() {
+        use axum::{
+            body::Bytes,
+            http::{HeaderMap, Uri},
+            response::IntoResponse,
+        };
+        type Trace = Arc<std::sync::Mutex<Vec<Value>>>;
+        async fn provider(
+            State(trace): State<Trace>,
+            method: Method,
+            uri: Uri,
+            headers: HeaderMap,
+            bytes: Bytes,
+        ) -> axum::response::Response {
+            assert_eq!(headers["authorization"], "Bearer synthetic-token");
+            let body = if bytes.is_empty() {
+                Value::Null
+            } else {
+                serde_json::from_slice(&bytes).unwrap()
+            };
+            trace
+                .lock()
+                .unwrap()
+                .push(json!({"method":method.as_str(),"path":uri.path(),"body":body}));
+            if method == Method::GET {
+                if uri.path().ends_with("/delta") {
+                    let values = if uri.path() == "/v1.0/me/todo/lists/delta" {
+                        json!([{"id":"list/+","displayName":"Authoritative list","wellknownListName":"none"}])
+                    } else {
+                        assert_eq!(uri.path(), "/v1.0/me/todo/lists/list%2F%2B/tasks/delta");
+                        json!([{"id":"task?=","title":"Refreshed recurring task","status":"notStarted","recurrence":{"pattern":{"type":"daily","interval":1},"range":{"type":"noEnd","startDate":"2026-11-06"}}}])
+                    };
+                    let host = headers["host"].to_str().unwrap();
+                    return Json(json!({"value":values,"@odata.deltaLink":format!("http://{host}{}?$deltatoken=next", uri.path())})).into_response();
+                }
+                assert!(
+                    uri.path() == "/v1.0/me/todo/lists/list%2F%2B"
+                        || uri.path() == "/v1.0/me/todo/lists/builtin"
+                );
+                return Json(json!({"id":"list/+","wellknownListName":if uri.path().ends_with("/builtin") { "flaggedEmails" } else { "none" }})).into_response();
+            }
+            if method == Method::DELETE {
+                return StatusCode::NO_CONTENT.into_response();
+            }
+            let mut response = body;
+            response["id"] = json!("remote-resource");
+            (
+                if method == Method::POST {
+                    StatusCode::CREATED
+                } else {
+                    StatusCode::OK
+                },
+                Json(response),
+            )
+                .into_response()
+        }
+        let trace: Trace = Arc::default();
+        let router = Router::new()
+            .route("/{*path}", any(provider))
+            .with_state(trace.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let root = format!("http://{}/v1.0/", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(Db::open(&dir.path().join("db")).unwrap());
+        db.upsert_account("a", "Test", "synthetic").unwrap();
+        let graph = Arc::new(GraphClient::for_test(&root));
+        let sync = Arc::new(Sync::new(db.clone(), graph.clone()));
+        let tools = Tools { db, graph, sync };
+        let task_fields = json!({
+            "title":"中文 task","body":{"contentType":"text","content":"A&B <C>\nnext"},
+            "importance":"high","status":"inProgress","categories":["中文","work"],
+            "startDateTime":{"dateTime":"2026-11-06T09:00:00","timeZone":"China Standard Time"},
+            "dueDateTime":{"dateTime":"2026-11-07T17:30:00","timeZone":"China Standard Time"},
+            "reminderDateTime":{"dateTime":"2026-11-07T09:00:00","timeZone":"China Standard Time"},"isReminderOn":true,
+            "recurrence":{"pattern":{"type":"weekly","interval":2,"daysOfWeek":["monday","friday"],"firstDayOfWeek":"monday"},"range":{"type":"endDate","startDate":"2026-11-06","endDate":"2026-12-31","recurrenceTimeZone":"China Standard Time"}}
+        });
+        let mut expected_task = task_fields.clone();
+        expected_task["body"] = json!({"contentType":"html","content":"A&amp;B &lt;C&gt;<br>next"});
+        let cleared_task = json!({"body":{"contentType":"html","content":"<p>Already HTML &amp; preserved</p>"},"dueDateTime":null,"startDateTime":null,"reminderDateTime":null,"recurrence":null,"isReminderOn":false,"categories":[]});
+        let resource = json!({"webUrl":"https://example.com/doc?q=中文","applicationName":"Test app","displayName":"Reference","externalId":"external-123"});
+        // Expectations are literal paths rather than calls to the route/segment
+        // helpers under test, including reserved-character entity identifiers.
+        let cases = [
+            (
+                "create_list",
+                "POST",
+                "/me/todo/lists",
+                json!({"data":{"displayName":"New list"}}),
+                json!({"displayName":"New list"}),
+            ),
+            (
+                "update_list",
+                "PATCH",
+                "/me/todo/lists/list%2F%2B",
+                json!({"list_id":"list/+","data":{"displayName":"Renamed list"}}),
+                json!({"displayName":"Renamed list"}),
+            ),
+            (
+                "delete_list",
+                "DELETE",
+                "/me/todo/lists/list%2F%2B",
+                json!({"list_id":"list/+"}),
+                Value::Null,
+            ),
+            (
+                "create_task",
+                "POST",
+                "/me/todo/lists/list%2F%2B/tasks",
+                json!({"list_id":"list/+","data":task_fields}),
+                expected_task,
+            ),
+            (
+                "update_task",
+                "PATCH",
+                "/me/todo/lists/list%2F%2B/tasks/task%3F%3D",
+                json!({"list_id":"list/+","task_id":"task?=","data":cleared_task}),
+                cleared_task.clone(),
+            ),
+            (
+                "delete_task",
+                "DELETE",
+                "/me/todo/lists/list%2F%2B/tasks/task%3F%3D",
+                json!({"list_id":"list/+","task_id":"task?="}),
+                Value::Null,
+            ),
+            (
+                "complete_task",
+                "PATCH",
+                "/me/todo/lists/list%2F%2B/tasks/task%3F%3D",
+                json!({"list_id":"list/+","task_id":"task?="}),
+                json!({"status":"completed"}),
+            ),
+            (
+                "reopen_task",
+                "PATCH",
+                "/me/todo/lists/list%2F%2B/tasks/task%3F%3D",
+                json!({"list_id":"list/+","task_id":"task?="}),
+                json!({"status":"notStarted"}),
+            ),
+            (
+                "create_step",
+                "POST",
+                "/me/todo/lists/list%2F%2B/tasks/task%3F%3D/checklistItems",
+                json!({"list_id":"list/+","task_id":"task?=","data":{"displayName":"Step","isChecked":false}}),
+                json!({"displayName":"Step","isChecked":false}),
+            ),
+            (
+                "update_step",
+                "PATCH",
+                "/me/todo/lists/list%2F%2B/tasks/task%3F%3D/checklistItems/item%2F%23",
+                json!({"list_id":"list/+","task_id":"task?=","item_id":"item/#","data":{"displayName":"Updated step","isChecked":true}}),
+                json!({"displayName":"Updated step","isChecked":true}),
+            ),
+            (
+                "delete_step",
+                "DELETE",
+                "/me/todo/lists/list%2F%2B/tasks/task%3F%3D/checklistItems/item%2F%23",
+                json!({"list_id":"list/+","task_id":"task?=","item_id":"item/#"}),
+                Value::Null,
+            ),
+            (
+                "create_linked_resource",
+                "POST",
+                "/me/todo/lists/list%2F%2B/tasks/task%3F%3D/linkedResources",
+                json!({"list_id":"list/+","task_id":"task?=","data":resource}),
+                resource.clone(),
+            ),
+            (
+                "update_linked_resource",
+                "PATCH",
+                "/me/todo/lists/list%2F%2B/tasks/task%3F%3D/linkedResources/item%2F%23",
+                json!({"list_id":"list/+","task_id":"task?=","item_id":"item/#","data":{"webUrl":"https://example.com/new","externalId":"revised"}}),
+                json!({"webUrl":"https://example.com/new","externalId":"revised"}),
+            ),
+            (
+                "delete_linked_resource",
+                "DELETE",
+                "/me/todo/lists/list%2F%2B/tasks/task%3F%3D/linkedResources/item%2F%23",
+                json!({"list_id":"list/+","task_id":"task?=","item_id":"item/#"}),
+                Value::Null,
+            ),
+        ];
+        assert_eq!(cases.len(), 14);
+        for (name, method, path, mut args, body) in cases {
+            args["account_id"] = json!("a");
+            args["operation_key"] = json!(format!("contract-{name}"));
+            trace.lock().unwrap().clear();
+            let result = tools.call(name, args.clone()).await.unwrap();
+            assert_eq!(
+                result["operation"]["state"], "succeeded",
+                "{name}: {result}"
+            );
+            assert_eq!(result["sync"]["state"], "ready", "{name}: {result}");
+            let calls = trace.lock().unwrap().clone();
+            let preflight = usize::from(matches!(name, "update_list" | "delete_list"));
+            assert_eq!(calls.len(), preflight + 3, "{name}: {calls:?}");
+            if preflight == 1 {
+                assert_eq!(
+                    calls[0],
+                    json!({"method":"GET","path":format!("/v1.0{path}"),"body":null})
+                );
+            }
+            assert_eq!(
+                calls[preflight],
+                json!({"method":method,"path":format!("/v1.0{path}"),"body":body}),
+                "{name}"
+            );
+            assert_eq!(calls[preflight + 1]["path"], "/v1.0/me/todo/lists/delta");
+            assert_eq!(
+                calls[preflight + 2]["path"],
+                "/v1.0/me/todo/lists/list%2F%2B/tasks/delta"
+            );
+            assert_eq!(calls[preflight + 1]["method"], "GET");
+            assert_eq!(calls[preflight + 2]["method"], "GET");
+            if name == "complete_task" {
+                let cached = tools.db.cached_page("a", Some("list/+"), 1, 0).unwrap();
+                assert_eq!(cached[0]["title"], "Refreshed recurring task");
+                assert_eq!(cached[0]["status"], "notStarted");
+            }
+            assert_eq!(
+                tools.call(name, args).await.unwrap()["operation"]["state"],
+                "succeeded"
+            );
+            assert_eq!(
+                *trace.lock().unwrap(),
+                calls,
+                "{name} replay contacted Graph"
+            );
+        }
+        for name in ["update_list", "delete_list"] {
+            let mut args = json!({"account_id":"a","operation_key":format!("builtin-{name}"),"list_id":"builtin"});
+            if name == "update_list" {
+                args["data"] = json!({"displayName":"Disallowed rename"});
+            }
+            trace.lock().unwrap().clear();
+            let result = tools.call(name, args.clone()).await.unwrap();
+            assert_eq!(result["operation"]["state"], "failed");
+            assert_eq!(
+                result["operation"]["response"]["error"]["code"],
+                "builtin_list"
+            );
+            let calls = trace.lock().unwrap().clone();
+            assert_eq!(
+                calls,
+                vec![json!({"method":"GET","path":"/v1.0/me/todo/lists/builtin","body":null})]
+            );
+            assert_eq!(
+                tools.call(name, args).await.unwrap()["operation"]["state"],
+                "failed"
+            );
+            assert_eq!(*trace.lock().unwrap(), calls);
+        }
+        server.abort();
     }
     #[tokio::test]
     async fn unknown_post_is_journaled_once_and_never_replayed() {

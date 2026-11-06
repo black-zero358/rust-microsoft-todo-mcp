@@ -71,7 +71,7 @@ The `todo-data` volume contains a SQLite WAL database. Back it up together with 
 
 For a simple consistent backup, stop the service, copy the **whole volume**, then restart. Do not copy just `todo.db` while WAL writes are active. Test restore into an isolated instance before depending on the backup.
 
-Before an upgrade, back up the data and `.env`, record the image/commit, rebuild and restart. Keep the previous image for rollback. Do not run two instances sharing the same SQLite volume. Startup changes interrupted pending writes to `unknown`; use the original operation key to inspect/reconcile them. Database schema versions newer than the running binary are rejected.
+Before an upgrade, back up the data and `.env`, record the image/commit, rebuild and restart. Keep the previous image and its pre-upgrade data backup for rollback. This hardening candidate upgrades the database to schema 3; an older schema-2 binary rejects that upgraded volume. Roll back the image and its matching backup together, accounting for writes made after the backup. Do not run two instances sharing the same SQLite volume. A lifetime OS lock on the database rejects a second process before startup recovery can modify live operation records; deploy on a local filesystem with reliable advisory locking. Startup changes interrupted pending writes to `unknown`; use the original operation key to inspect/reconcile them. Database schema versions newer than the running binary are rejected.
 
 Expired delta cursors trigger a replacement scan. The previous visible cache remains readable until the replacement stream is atomically published. A failed initial scan returns incomplete freshness state. If Microsoft reports `reauthorization_required`, reconnect the account in the management page.
 
@@ -84,3 +84,5 @@ Expired delta cursors trigger a replacement scan. The previous visible cache rem
 - 32 simultaneous admitted tool calls; busy clients retry with the original operation key.
 - Background interval defaults to 60 seconds. Safe reads retry bounded 429/5xx failures; mutations are never automatically replayed.
 - Logs contain status/error codes rather than tokens or task bodies. Avoid verbose dependency tracing in production.
+
+Shutdown closes tool admission, allows up to 30 seconds for HTTP shutdown, then up to 10 seconds for already-admitted tool calls. Configure the container stop grace period above 40 seconds. Forced termination recovers unfinished write intents as `unknown` on the next startup. HTTP request bodies have a 15-second receive deadline; at most 64 HTTP requests and 32 detached tool calls are admitted concurrently.

@@ -74,22 +74,44 @@ impl Sync {
         stream: &str,
         initial: &str,
     ) -> Result<()> {
+        self.stream_with_budget(account, generation, stream, initial, 10_000)
+            .await
+    }
+    async fn stream_with_budget(
+        &self,
+        account: &str,
+        generation: i64,
+        stream: &str,
+        initial: &str,
+        page_budget: usize,
+    ) -> Result<()> {
+        let initial = self.graph.validate_url(initial)?;
+        self.db.sync_cursor(account, generation, stream, &initial)?;
+        self.db
+            .normalize_sync_urls(account, generation, stream, |url| {
+                self.graph.validate_url(url)
+            })?;
         let mut seen = HashSet::new();
         let mut resets = 0;
-        for _ in 0..10_000 {
-            let cursor = self.db.sync_cursor(account, generation, stream, initial)?;
-            if !seen.insert(cursor.url.clone()) {
+        for _ in 0..page_budget {
+            let cursor = self.db.sync_cursor(account, generation, stream, &initial)?;
+            if !seen.insert(self.graph.validate_url(&cursor.url)?) {
                 return Err(Error::new(
                     "invalid_graph_response",
                     "Graph returned a repeated synchronization continuation",
                 ));
             }
-            let page = match self.graph.get(account, &cursor.url).await {
+            let page = match self
+                .graph
+                .get_at_generation(account, generation, &cursor.url)
+                .await
+            {
                 Ok(page) => page,
                 Err(e) if e.code == "sync_cursor_expired" && resets == 0 => {
                     resets += 1;
                     seen.clear();
-                    self.db.reset_cursor(account, generation, stream, initial)?;
+                    self.db
+                        .reset_cursor(account, generation, stream, &initial)?;
                     continue;
                 }
                 Err(e) => return Err(e),
@@ -102,17 +124,42 @@ impl Sync {
             })?;
             let next = page.get("@odata.nextLink").and_then(Value::as_str);
             let delta = page.get("@odata.deltaLink").and_then(Value::as_str);
-            if next.is_some() == delta.is_some() {
+            if next.is_some() == delta.is_some()
+                || page.get("@odata.nextLink").is_some() != next.is_some()
+                || page.get("@odata.deltaLink").is_some() != delta.is_some()
+            {
                 return Err(Error::new(
                     "invalid_graph_response",
                     "Graph delta response must contain exactly one continuation or delta link",
                 ));
             }
             for link in [next, delta].into_iter().flatten() {
+                if link.is_empty() {
+                    return Err(Error::new(
+                        "invalid_graph_response",
+                        "Graph returned an empty synchronization link",
+                    ));
+                }
                 self.graph.validate_url(link)?;
             }
-            self.db
-                .apply_sync_page(account, generation, stream, values, next, delta)?;
+            let next = next.map(|url| self.graph.validate_url(url)).transpose()?;
+            let delta = delta.map(|url| self.graph.validate_url(url)).transpose()?;
+            if let Some(next) = &next
+                && seen.contains(next)
+            {
+                return Err(Error::new(
+                    "invalid_graph_response",
+                    "Graph returned a repeated synchronization continuation",
+                ));
+            }
+            self.db.apply_sync_page(
+                account,
+                generation,
+                stream,
+                values,
+                next.as_deref(),
+                delta.as_deref(),
+            )?;
             if next.is_none() {
                 return Ok(());
             }
@@ -278,6 +325,7 @@ mod tests {
             ),
         ])
         .await;
+        let expected_cursor = graph.validate_url("/me/todo/lists/delta?page=2").unwrap();
         let err = Sync::new(db.clone(), graph).refresh("a").await.unwrap_err();
         assert_eq!(err.code, "invalid_graph_response");
         assert!(db.lists("a").unwrap().is_empty());
@@ -286,7 +334,7 @@ mod tests {
             db.sync_cursor("a", a.generation, "lists", "initial")
                 .unwrap()
                 .url,
-            "/me/todo/lists/delta?page=2"
+            expected_cursor
         );
         server.abort();
     }
@@ -316,5 +364,151 @@ mod tests {
         assert_eq!(work.await.unwrap().unwrap_err().code, "account_changed");
         assert!(db.lists("a").unwrap().is_empty());
         server.abort();
+    }
+    #[tokio::test]
+    async fn page_budget_persists_progress_and_next_refresh_resumes() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(Db::open(&dir.path().join("cache.db")).unwrap());
+        let a = db.upsert_account("a", "A", "encrypted").unwrap();
+        let (graph, queue, server) = graph(vec![
+            ok(
+                "/v1.0/me/todo/lists/delta",
+                json!({"value":[],"@odata.nextLink":"/me/todo/lists/delta?page=2"}),
+            ),
+            ok(
+                "/v1.0/me/todo/lists/delta?page=2",
+                json!({"value":[],"@odata.deltaLink":"/me/todo/lists/delta?token=done"}),
+            ),
+        ])
+        .await;
+        let sync = Sync::new(db.clone(), graph.clone());
+        assert_eq!(
+            sync.stream_with_budget("a", a.generation, "lists", "/me/todo/lists/delta", 1)
+                .await
+                .unwrap_err()
+                .code,
+            "sync_page_limit"
+        );
+        assert_eq!(db.sync_status("a").unwrap()["pending_streams"], 1);
+        drop(sync);
+        assert_eq!(
+            Sync::new(db.clone(), graph).refresh("a").await.unwrap()["complete"],
+            true
+        );
+        assert!(queue.lock().await.is_empty());
+        server.abort();
+    }
+    #[tokio::test]
+    async fn normalized_self_link_is_rejected_before_staging() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(Db::open(&dir.path().join("cache.db")).unwrap());
+        let a = db.upsert_account("a", "A", "encrypted").unwrap();
+        let (graph, queue, server) = graph(vec![ok(
+            "/v1.0/me/todo/lists/delta",
+            json!({"value":[{"id":"bad"}],"@odata.nextLink":"/v1.0/me/todo/lists/delta"}),
+        )])
+        .await;
+        let expected_cursor = graph.validate_url("/me/todo/lists/delta").unwrap();
+        assert_eq!(
+            Sync::new(db.clone(), graph)
+                .refresh("a")
+                .await
+                .unwrap_err()
+                .code,
+            "invalid_graph_response"
+        );
+        assert_eq!(
+            db.sync_cursor("a", a.generation, "lists", "initial")
+                .unwrap()
+                .url,
+            expected_cursor
+        );
+        assert!(db.lists("a").unwrap().is_empty());
+        assert!(queue.lock().await.is_empty());
+        server.abort();
+    }
+    #[tokio::test]
+    async fn malformed_link_types_never_publish_a_page() {
+        for page in [
+            json!({"value":[{"id":"bad"}],"@odata.nextLink":42,"@odata.deltaLink":"/me/todo/lists/delta?token=d"}),
+            json!({"value":[{"id":"bad"}],"@odata.nextLink":null,"@odata.deltaLink":"/me/todo/lists/delta?token=d"}),
+            json!({"value":[{"id":"bad"}],"@odata.deltaLink":""}),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = Arc::new(Db::open(&dir.path().join("cache.db")).unwrap());
+            db.upsert_account("a", "A", "encrypted").unwrap();
+            let (graph, queue, server) = graph(vec![ok("/v1.0/me/todo/lists/delta", page)]).await;
+            assert_eq!(
+                Sync::new(db.clone(), graph)
+                    .refresh("a")
+                    .await
+                    .unwrap_err()
+                    .code,
+                "invalid_graph_response"
+            );
+            assert!(db.lists("a").unwrap().is_empty());
+            assert_eq!(db.sync_status("a").unwrap()["pending_streams"], 1);
+            assert!(queue.lock().await.is_empty());
+            server.abort();
+        }
+    }
+    #[tokio::test]
+    async fn equivalent_url_cycle_is_rejected_across_restart_and_page_budgets() {
+        for legacy_raw_urls in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("cache.db");
+            let db = Arc::new(Db::open(&path).unwrap());
+            let a = db.upsert_account("a", "A", "encrypted").unwrap();
+            let initial = "/me/todo/lists/delta";
+            let page2 = "/me/todo/lists/delta?page=2";
+            let replies = if legacy_raw_urls {
+                vec![]
+            } else {
+                vec![ok(
+                    "/v1.0/me/todo/lists/delta",
+                    json!({"value":[],"@odata.nextLink":page2}),
+                )]
+            };
+            let (graph, queue, server) = graph(replies).await;
+            let absolute_initial = graph.validate_url(initial).unwrap();
+            queue.lock().await.push_back(ok(
+                "/v1.0/me/todo/lists/delta?page=2",
+                json!({"value":[{"id":"bad"}],"@odata.nextLink":absolute_initial}),
+            ));
+            if legacy_raw_urls {
+                db.sync_cursor("a", a.generation, "lists", initial).unwrap();
+                db.apply_sync_page("a", a.generation, "lists", &[], Some(page2), None)
+                    .unwrap();
+            } else {
+                let sync = Sync::new(db.clone(), graph.clone());
+                assert_eq!(
+                    sync.stream_with_budget("a", a.generation, "lists", initial, 1)
+                        .await
+                        .unwrap_err()
+                        .code,
+                    "sync_page_limit"
+                );
+            }
+            drop(db);
+            let db = Arc::new(Db::open(&path).unwrap());
+            let sync = Sync::new(db.clone(), graph.clone());
+            assert_eq!(
+                sync.stream_with_budget("a", a.generation, "lists", initial, 1)
+                    .await
+                    .unwrap_err()
+                    .code,
+                "invalid_graph_response",
+                "legacy={legacy_raw_urls}"
+            );
+            assert_eq!(
+                db.sync_cursor("a", a.generation, "lists", initial)
+                    .unwrap()
+                    .url,
+                graph.validate_url(page2).unwrap()
+            );
+            assert!(db.lists("a").unwrap().is_empty());
+            assert!(queue.lock().await.is_empty());
+            server.abort();
+        }
     }
 }

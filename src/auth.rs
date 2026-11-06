@@ -35,6 +35,7 @@ pub struct Auth {
     microsoft_authority: String,
     profile_url: String,
     login_epoch: AtomicU64,
+    account_changes: Mutex<()>,
     keys: Mutex<Option<(JwkSet, Instant)>>,
     key_refresh: Mutex<Option<Instant>>,
     logins: Mutex<HashMap<String, DeviceLogin>>,
@@ -52,6 +53,17 @@ struct AccessToken {
     token: Zeroizing<String>,
     expires: Instant,
     generation: i64,
+}
+#[derive(Deserialize)]
+struct VerifiedClaims {
+    #[serde(flatten)]
+    identity: Claims,
+    // jsonwebtoken also accepts array issuers and ignores malformed optional nbf.
+    // Keep its signature/time checks, but enforce these claim shapes ourselves.
+    #[serde(rename = "iss")]
+    _issuer: String,
+    #[serde(default, rename = "nbf", deserialize_with = "optional_numeric_date")]
+    _not_before: Option<serde_json::Number>,
 }
 #[derive(Deserialize)]
 struct Claims {
@@ -80,6 +92,7 @@ impl Auth {
             microsoft_authority: "https://login.microsoftonline.com".into(),
             profile_url: "https://graph.microsoft.com/v1.0/me?$select=id,displayName".into(),
             login_epoch: AtomicU64::new(0),
+            account_changes: Mutex::new(()),
             keys: Mutex::new(None),
             key_refresh: Mutex::new(None),
             logins: Mutex::new(HashMap::new()),
@@ -119,10 +132,14 @@ impl Auth {
         validation.set_required_spec_claims(&["exp", "iss", "aud", "sub"]);
         validation.validate_nbf = true;
         validation.leeway = 30;
-        let claims = decode::<Claims>(token, &key, &validation)
+        let claims = decode::<VerifiedClaims>(token, &key, &validation)
             .map_err(|_| unauthorized())?
             .claims;
-        authorize_claims(claims, &self.config.owner_subject, &self.config.scope)
+        authorize_claims(
+            claims.identity,
+            &self.config.owner_subject,
+            &self.config.scope,
+        )
     }
     async fn signing_key(&self, kid: &str) -> Result<DecodingKey> {
         {
@@ -144,8 +161,21 @@ impl Auth {
                 return decoding_key(key);
             }
         }
-        if last.is_some_and(|t| t.elapsed() < REFRESH_COOLDOWN) {
-            return Err(unauthorized());
+        if let Some(attempted) = *last
+            && attempted.elapsed() < REFRESH_COOLDOWN
+        {
+            let keys = self.keys.lock().await;
+            let fetch_succeeded = keys
+                .as_ref()
+                .is_some_and(|(_, fetched)| *fetched >= attempted);
+            return Err(if fetch_succeeded {
+                unauthorized()
+            } else {
+                Error::new(
+                    "auth_unavailable",
+                    "Authorization signing keys are temporarily unavailable",
+                )
+            });
         }
         *last = Some(Instant::now());
         let response = self
@@ -192,6 +222,7 @@ impl Auth {
                 "Complete or wait for an existing account login to expire",
             ));
         }
+        let requested_at = Instant::now();
         let response = self
             .client
             .post(self.microsoft_endpoint("devicecode"))
@@ -231,14 +262,16 @@ impl Auth {
             .as_u64()
             .filter(|v| (1..=1800).contains(v))
             .ok_or_else(malformed)?;
-        let interval = value["interval"].as_u64().unwrap_or(5).clamp(5, 60);
+        // Never poll faster than Microsoft requests. An interval beyond the
+        // session lifetime expires locally without another provider request.
+        let interval = value["interval"].as_u64().unwrap_or(5).max(5).min(expires);
         let id = uuid::Uuid::new_v4().to_string();
         logins.insert(
             id.clone(),
             DeviceLogin {
                 epoch: self.login_epoch.load(Ordering::SeqCst),
                 code: Zeroizing::new(code),
-                expires: Instant::now() + Duration::from_secs(expires),
+                expires: requested_at + Duration::from_secs(expires),
                 next_poll: Instant::now() + Duration::from_secs(interval),
                 interval,
             },
@@ -257,6 +290,7 @@ impl Auth {
             return Ok(json!({"status":"pending","interval":login.interval}));
         }
         login.next_poll = Instant::now() + Duration::from_secs(login.interval);
+        let requested_at = Instant::now();
         let response = self
             .client
             .post(self.microsoft_endpoint("token"))
@@ -281,7 +315,7 @@ impl Auth {
                     return Ok(json!({"status":"pending","interval":login.interval}));
                 }
                 Some("slow_down") => {
-                    login.interval = (login.interval + 5).min(60);
+                    login.interval = login.interval.saturating_add(5);
                     login.next_poll = Instant::now() + Duration::from_secs(login.interval);
                     return Ok(json!({"status":"pending","interval":login.interval}));
                 }
@@ -295,6 +329,7 @@ impl Auth {
             }
         }
         let epoch = login.epoch;
+        let login_expires = login.expires;
         // A successful code is single-use; remove it before any subsequent network request.
         logins.remove(login_id);
         drop(logins);
@@ -331,10 +366,13 @@ impl Auth {
         }
         let lock = self.account_lock(&id).await;
         let _guard = lock.lock().await;
-        if self.login_epoch.load(Ordering::SeqCst) != epoch {
+        // Different account locks do not serialize commits on a multithreaded
+        // runtime. Fence revocation and the global account limit as one operation.
+        let _changes = self.account_changes.lock().await;
+        if self.login_epoch.load(Ordering::SeqCst) != epoch || Instant::now() >= login_expires {
             return Err(Error::new(
                 "login_expired",
-                "Account disconnection cancelled pending logins; start a new login",
+                "Account login expired or was cancelled; start a new login",
             ));
         }
         if self.db.accounts()?.len() >= 32 && self.db.account(&id).is_err() {
@@ -349,7 +387,7 @@ impl Auth {
             id.clone(),
             AccessToken {
                 token: access,
-                expires: Instant::now() + lifetime,
+                expires: requested_at + lifetime,
                 generation: account.generation,
             },
         );
@@ -417,6 +455,7 @@ impl Auth {
             }
         }
         let refresh = decrypt_token(&self.config.encryption_key, account_id, &encrypted)?;
+        let requested_at = Instant::now();
         let response = self
             .client
             .post(self.microsoft_endpoint("token"))
@@ -462,7 +501,7 @@ impl Auth {
             account_id.into(),
             AccessToken {
                 token: access,
-                expires: Instant::now() + lifetime,
+                expires: requested_at + lifetime,
                 generation,
             },
         );
@@ -473,6 +512,7 @@ impl Auth {
     pub async fn revoke(&self, account_id: &str) -> Result<()> {
         let lock = self.account_lock(account_id).await;
         let _guard = lock.lock().await;
+        let _changes = self.account_changes.lock().await;
         self.login_epoch.fetch_add(1, Ordering::SeqCst);
         self.db.remove_account(account_id)?;
         self.logins.lock().await.clear();
@@ -506,6 +546,23 @@ fn constant_eq(a: &str, b: &str) -> bool {
         .ct_eq(&Sha256::digest(b.as_bytes()))
         .into()
 }
+fn optional_numeric_date<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<serde_json::Number>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let number = serde_json::Number::deserialize(deserializer)?;
+    if number.as_u64().is_some()
+        || number
+            .as_f64()
+            .is_some_and(|n| n >= 0.0 && n < u64::MAX as f64)
+    {
+        Ok(Some(number))
+    } else {
+        Err(serde::de::Error::custom("Invalid numeric date"))
+    }
+}
 fn authorize_claims(claims: Claims, owner: &str, scope: &str) -> Result<String> {
     if claims.sub != owner || !claims.scope.split_ascii_whitespace().any(|s| s == scope) {
         return Err(unauthorized());
@@ -534,7 +591,10 @@ fn take_secret(value: &mut Value, name: &str) -> Result<Zeroizing<String>> {
     let secret = value
         .get_mut(name)
         .map(Value::take)
-        .and_then(|v| v.as_str().map(str::to_owned))
+        .and_then(|v| match v {
+            Value::String(secret) => Some(secret),
+            _ => None,
+        })
         .filter(|s| !s.is_empty())
         .ok_or_else(malformed)?;
     Ok(Zeroizing::new(secret))
@@ -757,9 +817,25 @@ CQnO+yVTmDvAoQEBRe9YRHE=
         let now = chrono::Utc::now().timestamp();
         let claims = json!({"sub":"owner","iss":"https://auth.example.com","aud":"https://todo.example.com/mcp","scope":"openid todo:mcp","exp":now+300,"nbf":now-1});
         assert_eq!(auth.verify_bearer(&signed(&claims)).await.unwrap(), "owner");
+        let mut optional_nbf = claims.clone();
+        optional_nbf.as_object_mut().unwrap().remove("nbf");
+        assert!(auth.verify_bearer(&signed(&optional_nbf)).await.is_ok());
+        optional_nbf["nbf"] = json!(now as f64 - 0.5);
+        assert!(auth.verify_bearer(&signed(&optional_nbf)).await.is_ok());
+        let mut scp = claims.clone();
+        scp.as_object_mut().unwrap().remove("scope");
+        scp["scp"] = json!("todo:mcp");
+        assert!(auth.verify_bearer(&signed(&scp)).await.is_ok());
         for (field, value) in [
             ("sub", json!("other")),
             ("iss", json!("https://other.example.com")),
+            (
+                "iss",
+                json!(["https://auth.example.com", "https://other.example.com"]),
+            ),
+            ("nbf", json!("not-a-timestamp")),
+            ("nbf", json!(null)),
+            ("nbf", json!(-1)),
             ("aud", json!("another-resource")),
             ("scope", json!("todo:mcp-admin")),
             ("exp", json!(now - 60)),
@@ -794,6 +870,47 @@ CQnO+yVTmDvAoQEBRe9YRHE=
         assert!(!auth.admin_authorized(&signed(&claims)));
     }
     #[tokio::test]
+    async fn jwks_failure_stays_unavailable_during_refresh_cooldown() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = calls.clone();
+        let app = axum::Router::new().route(
+            "/jwks",
+            axum::routing::get(move || {
+                let seen = seen.clone();
+                async move {
+                    seen.fetch_add(1, Ordering::SeqCst);
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut config = config();
+        config.jwks_url = format!("http://{}/jwks", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let tmp = tempfile::tempdir().unwrap();
+        let auth = Auth::new(
+            Arc::new(config),
+            Arc::new(Db::open(&tmp.path().join("jwks.db")).unwrap()),
+        )
+        .unwrap();
+        for _ in 0..2 {
+            let error = auth.signing_key("missing").await.err().unwrap();
+            assert_eq!(error.code, "auth_unavailable");
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        // A successful key-set fetch that lacks this kid is an invalid token,
+        // unlike a provider outage, and still must not trigger another fetch.
+        *auth.keys.lock().await = Some((JwkSet { keys: vec![] }, Instant::now()));
+        assert_eq!(
+            auth.signing_key("missing").await.err().unwrap().code,
+            "unauthorized"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        server.abort();
+    }
+    #[tokio::test]
     async fn removed_account_cannot_use_cached_access_token() {
         let tmp = tempfile::tempdir().unwrap();
         let db = Arc::new(Db::open(&tmp.path().join("auth.db")).unwrap());
@@ -821,12 +938,15 @@ CQnO+yVTmDvAoQEBRe9YRHE=
         tokens: Mutex<std::collections::VecDeque<(u16, Value)>>,
         polls: std::sync::atomic::AtomicUsize,
         pause_profile: bool,
+        device_interval: AtomicU64,
         profile_started: tokio::sync::Notify,
         profile_release: tokio::sync::Notify,
     }
-    async fn device_code() -> axum::Json<Value> {
+    async fn device_code(
+        axum::extract::State(state): axum::extract::State<Arc<DeviceFixture>>,
+    ) -> axum::Json<Value> {
         axum::Json(
-            json!({"device_code":"synthetic-device-secret","user_code":"ABCD-EFGH","verification_uri":"https://microsoft.com/devicelogin","expires_in":900,"interval":5}),
+            json!({"device_code":"synthetic-device-secret","user_code":"ABCD-EFGH","verification_uri":"https://microsoft.com/devicelogin","expires_in":900,"interval":state.device_interval.load(Ordering::SeqCst)}),
         )
     }
     async fn fixture_token(
@@ -866,6 +986,7 @@ CQnO+yVTmDvAoQEBRe9YRHE=
             tokens: Mutex::new(tokens.into()),
             polls: std::sync::atomic::AtomicUsize::new(0),
             pause_profile,
+            device_interval: AtomicU64::new(5),
             profile_started: tokio::sync::Notify::new(),
             profile_release: tokio::sync::Notify::new(),
         });
@@ -952,6 +1073,41 @@ CQnO+yVTmDvAoQEBRe9YRHE=
         server.abort();
     }
     #[tokio::test]
+    async fn identity_lookup_does_not_extend_access_token_deadline() {
+        let (auth, state, server, _tmp) = fixture(vec![(200, json!({"access_token":"synthetic-access", "refresh_token":"synthetic-refresh", "expires_in":3600}))], true).await;
+        let login = auth.start_device_login().await.unwrap();
+        let id = login["login_id"].as_str().unwrap().to_owned();
+        allow_poll(&auth, &id).await;
+        let polling = tokio::spawn({
+            let auth = auth.clone();
+            async move { auth.poll_device_login(&id).await }
+        });
+        tokio::time::timeout(Duration::from_secs(3), state.profile_started.notified())
+            .await
+            .unwrap();
+        let latest_deadline = Instant::now() + Duration::from_secs(3540);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        state.profile_release.notify_one();
+        let connected = polling.await.unwrap().unwrap();
+        let account = connected["account"]["id"].as_str().unwrap();
+        assert!(auth.access.lock().await[account].expires <= latest_deadline);
+        server.abort();
+    }
+    #[tokio::test]
+    async fn provider_poll_interval_and_repeated_slowdown_are_respected() {
+        let (auth, state, server, _tmp) =
+            fixture(vec![(400, json!({"error":"slow_down"}))], false).await;
+        state.device_interval.store(120, Ordering::SeqCst);
+        let login = auth.start_device_login().await.unwrap();
+        assert_eq!(login["interval"], 120);
+        let id = login["login_id"].as_str().unwrap();
+        allow_poll(&auth, id).await;
+        assert_eq!(auth.poll_device_login(id).await.unwrap()["interval"], 125);
+        assert_eq!(auth.poll_device_login(id).await.unwrap()["interval"], 125);
+        assert_eq!(state.polls.load(Ordering::SeqCst), 1);
+        server.abort();
+    }
+    #[tokio::test]
     async fn expired_device_login_does_not_poll_microsoft() {
         let (auth, state, server, _tmp) = fixture(vec![], false).await;
         let login = auth.start_device_login().await.unwrap();
@@ -990,6 +1146,28 @@ CQnO+yVTmDvAoQEBRe9YRHE=
         let result = polling.await.unwrap().unwrap_err();
         assert_eq!(result.code, "login_expired");
         assert!(auth.db.account(&account).is_err());
+        assert!(auth.access.lock().await.is_empty());
+        server.abort();
+    }
+    #[tokio::test]
+    async fn login_expiring_during_identity_lookup_cannot_connect() {
+        let (auth, state, server, _tmp) = fixture(vec![(200, json!({"access_token":"synthetic-access", "refresh_token":"synthetic-refresh", "expires_in":3600}))], true).await;
+        let login = auth.start_device_login().await.unwrap();
+        let id = login["login_id"].as_str().unwrap().to_owned();
+        allow_poll(&auth, &id).await;
+        let expires = Instant::now() + Duration::from_secs(1);
+        auth.logins.lock().await.get_mut(&id).unwrap().expires = expires;
+        let polling = tokio::spawn({
+            let auth = auth.clone();
+            async move { auth.poll_device_login(&id).await }
+        });
+        tokio::time::timeout(Duration::from_secs(3), state.profile_started.notified())
+            .await
+            .unwrap();
+        tokio::time::sleep_until(tokio::time::Instant::from_std(expires)).await;
+        state.profile_release.notify_one();
+        assert_eq!(polling.await.unwrap().unwrap_err().code, "login_expired");
+        assert!(auth.db.accounts().unwrap().is_empty());
         assert!(auth.access.lock().await.is_empty());
         server.abort();
     }

@@ -138,6 +138,17 @@ impl GraphClient {
             .await
     }
 
+    /// Bind safe reads and retries to the authorization that started the scan.
+    pub async fn get_at_generation(
+        &self,
+        account: &str,
+        generation: i64,
+        path: &str,
+    ) -> Result<Value> {
+        self.request(account, Method::GET, path, None, Some(generation))
+            .await
+    }
+
     pub async fn write(
         &self,
         account_id: &str,
@@ -251,6 +262,11 @@ impl GraphClient {
             }
             if !status.is_success() {
                 return Err(status_error(status, read));
+            }
+            // Accepted means queued, not completed. To Do has no supported
+            // asynchronous-operation polling contract here, so reconcile only.
+            if !read && status == StatusCode::ACCEPTED {
+                return Err(unknown());
             }
             if status == StatusCode::NO_CONTENT {
                 return Ok(Value::Null);
@@ -494,6 +510,36 @@ mod tests {
             status_error(StatusCode::GONE, true).code,
             "sync_cursor_expired"
         );
+    }
+    #[tokio::test]
+    async fn accepted_and_timeout_mutations_are_unknown_without_replay() {
+        let n = Arc::new(AtomicUsize::new(0));
+        async fn accepted(State(n): State<Arc<AtomicUsize>>) -> StatusCode {
+            n.fetch_add(1, Ordering::SeqCst);
+            StatusCode::ACCEPTED
+        }
+        let (graph, task) = serve(
+            Router::new()
+                .route("/v1.0/accepted", any(accepted))
+                .with_state(n.clone())
+                .route(
+                    "/v1.0/timeout",
+                    any(|| async { StatusCode::REQUEST_TIMEOUT }),
+                ),
+        )
+        .await;
+        for path in ["/accepted", "/timeout"] {
+            assert_eq!(
+                graph
+                    .write("a", Method::POST, path, None)
+                    .await
+                    .unwrap_err()
+                    .code,
+                "write_unknown"
+            );
+        }
+        assert_eq!(n.load(Ordering::SeqCst), 1);
+        task.abort();
     }
     #[tokio::test]
     async fn reads_retry_but_ambiguous_writes_do_not() {

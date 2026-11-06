@@ -76,38 +76,62 @@ pub struct SyncCursor {
     pub rebuilding: bool,
 }
 
-pub struct Db(Mutex<Connection>);
+pub struct Db {
+    connection: Mutex<Connection>,
+    // Keep the lock until after SQLite closes. A second server must never recover live intents.
+    _instance_lock: std::fs::File,
+}
 impl Db {
     pub fn open(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
             std::fs::create_dir_all(parent).map_err(storage)?;
         }
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
         #[cfg(unix)]
         {
-            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-            let file = std::fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(false)
-                .mode(0o600)
-                .open(path)
-                .map_err(storage)?;
-            file.set_permissions(std::fs::Permissions::from_mode(0o600))
-                .map_err(storage)?;
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
         }
-        let conn = Connection::open(path).map_err(storage)?;
+        let instance_lock = options.open(path).map_err(storage)?;
+        instance_lock.try_lock().map_err(|e| match e {
+            std::fs::TryLockError::WouldBlock => Error::new(
+                "database_in_use",
+                "Another server is already using this database",
+            ),
+            std::fs::TryLockError::Error(e) => storage(e),
+        })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            instance_lock
+                .set_permissions(std::fs::Permissions::from_mode(0o600))
+                .map_err(storage)?;
+            // Existing sidecars may have been copied from an insecure backup.
+            for suffix in ["-wal", "-shm"] {
+                let mut sidecar = path.as_os_str().to_os_string();
+                sidecar.push(suffix);
+                match std::fs::set_permissions(sidecar, std::fs::Permissions::from_mode(0o600)) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(storage(e)),
+                }
+            }
+        }
+        let mut conn = Connection::open(path).map_err(storage)?;
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .map_err(storage)?;
-        if version > 2 {
+        if version > 3 {
             return Err(Error::new(
                 "unsupported_database_version",
                 "This database requires a newer server version",
             ));
         }
         conn.busy_timeout(Duration::from_secs(5)).map_err(storage)?;
-        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON; PRAGMA secure_delete=ON;
-        CREATE TABLE IF NOT EXISTS accounts (
+        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON; PRAGMA secure_delete=ON;").map_err(storage)?;
+        let tx = conn.transaction().map_err(storage)?;
+        tx.execute_batch("CREATE TABLE IF NOT EXISTS accounts (
             id TEXT PRIMARY KEY, display_name TEXT NOT NULL, is_default INTEGER NOT NULL DEFAULT 0,
             encrypted_token TEXT NOT NULL, generation INTEGER NOT NULL);
         CREATE UNIQUE INDEX IF NOT EXISTS one_default ON accounts(is_default) WHERE is_default=1;
@@ -127,6 +151,10 @@ impl Db {
         CREATE TABLE IF NOT EXISTS sync_stage (
             account_id TEXT NOT NULL, stream TEXT NOT NULL, id TEXT NOT NULL, data TEXT NOT NULL,
             PRIMARY KEY(account_id,stream,id),
+            FOREIGN KEY(account_id,stream) REFERENCES sync_cursors(account_id,stream) ON DELETE CASCADE);
+        CREATE TABLE IF NOT EXISTS sync_seen (
+            account_id TEXT NOT NULL, stream TEXT NOT NULL, url TEXT NOT NULL,
+            PRIMARY KEY(account_id,stream,url),
             FOREIGN KEY(account_id,stream) REFERENCES sync_cursors(account_id,stream) ON DELETE CASCADE);
         CREATE TABLE IF NOT EXISTS sync_status (
             account_id TEXT PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
@@ -148,10 +176,10 @@ impl Db {
             INSERT INTO task_fts(task_fts,rowid,title,body) VALUES('delete',old.rowid,old.title,old.body);
             INSERT INTO task_fts(rowid,title,body) VALUES(new.rowid,new.title,new.body); END;").map_err(storage)?;
         if version < 2 {
-            conn.execute("INSERT INTO task_fts(task_fts) VALUES('rebuild')", [])
+            tx.execute("INSERT INTO task_fts(task_fts) VALUES('rebuild')", [])
                 .map_err(storage)?;
             let rows: Vec<(i64, String)> = {
-                let mut stmt = conn
+                let mut stmt = tx
                     .prepare("SELECT rowid,data FROM tasks")
                     .map_err(storage)?;
                 stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
@@ -161,29 +189,31 @@ impl Db {
             };
             for (id, data) in rows {
                 let v = parse(data)?;
-                conn.execute(
+                tx.execute(
                     "UPDATE tasks SET body=?2 WHERE rowid=?1",
                     params![id, search_body(&v)],
                 )
                 .map_err(storage)?;
             }
-            conn.execute("INSERT INTO task_fts(task_fts) VALUES('rebuild')", [])
-                .map_err(storage)?;
-            conn.pragma_update(None, "user_version", 2)
+            tx.execute("INSERT INTO task_fts(task_fts) VALUES('rebuild')", [])
                 .map_err(storage)?;
         }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            if path.exists() {
-                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-                    .map_err(storage)?;
-            }
+        if version < 3 {
+            tx.execute(
+                "ALTER TABLE sync_stage ADD COLUMN reset_base INTEGER NOT NULL DEFAULT 0",
+                [],
+            )
+            .map_err(storage)?;
         }
-        Ok(Self(Mutex::new(conn)))
+        tx.pragma_update(None, "user_version", 3).map_err(storage)?;
+        tx.commit().map_err(storage)?;
+        Ok(Self {
+            connection: Mutex::new(conn),
+            _instance_lock: instance_lock,
+        })
     }
     fn conn(&self) -> Result<MutexGuard<'_, Connection>> {
-        self.0.lock().map_err(storage)
+        self.connection.lock().map_err(storage)
     }
     pub fn accounts(&self) -> Result<Vec<Account>> {
         let conn = self.conn()?;
@@ -433,7 +463,9 @@ impl Db {
             self.account(a)?;
         }
         for date in [&q.due_from, &q.due_to].into_iter().flatten() {
-            if chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").is_err() {
+            if chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d")
+                .map_or(true, |d| d.format("%Y-%m-%d").to_string() != *date)
+            {
                 return Err(Error::new(
                     "invalid_arguments",
                     "Date filters must use YYYY-MM-DD",
@@ -535,8 +567,12 @@ impl Db {
                 |r| r.get(0),
             )
             .map_err(storage)?;
+        let incomplete: i64 = conn.query_row(
+            "SELECT (NOT EXISTS(SELECT 1 FROM sync_cursors WHERE account_id=?1 AND stream='lists' AND delta_url IS NOT NULL)) + (SELECT count(*) FROM lists l WHERE account_id=?1 AND NOT EXISTS(SELECT 1 FROM sync_cursors c WHERE c.account_id=l.account_id AND c.stream='tasks:'||l.id AND c.delta_url IS NOT NULL))",
+            [account], |r| r.get(0),
+        ).map_err(storage)?;
         Ok(
-            json!({"account_id":account,"state":state,"last_success":last,"error_code":error,"pending_streams":pending,"complete":last.is_some() && state=="ready"}),
+            json!({"account_id":account,"state":state,"last_success":last,"error_code":error,"pending_streams":pending,"incomplete_streams":incomplete,"complete":last.is_some() && state=="ready" && pending == 0 && incomplete == 0}),
         )
     }
     pub fn set_sync_status(
@@ -572,6 +608,72 @@ impl Db {
         tx.commit().map_err(storage)?;
         Ok(cursor)
     }
+    /// Upgrade saved URL spellings without dropping staged pages or cycle history.
+    pub(crate) fn normalize_sync_urls(
+        &self,
+        account: &str,
+        generation: i64,
+        stream: &str,
+        normalize: impl Fn(&str) -> Result<String>,
+    ) -> Result<()> {
+        let mut conn = self.conn()?;
+        let tx = conn.transaction().map_err(storage)?;
+        fence(&tx, account, generation)?;
+        let (next, delta): (Option<String>, Option<String>) = tx
+            .query_row(
+                "SELECT next_url,delta_url FROM sync_cursors WHERE account_id=?1 AND stream=?2",
+                params![account, stream],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .map_err(storage)?;
+        let next = next.as_deref().map(&normalize).transpose()?;
+        let delta = delta.as_deref().map(&normalize).transpose()?;
+        // Iterate by URL in bounded batches. Reinsertions may be revisited once,
+        // but canonical URLs are stable and cannot cause an unbounded loop.
+        let mut after: Option<String> = None;
+        loop {
+            let urls: Vec<String> = {
+                let mut stmt = tx.prepare("SELECT url FROM sync_seen WHERE account_id=?1 AND stream=?2 AND (?3 IS NULL OR url>?3) ORDER BY url LIMIT 128").map_err(storage)?;
+                stmt.query_map(params![account, stream, after], |r| r.get(0))
+                    .map_err(storage)?
+                    .collect::<std::result::Result<_, _>>()
+                    .map_err(storage)?
+            };
+            if urls.is_empty() {
+                break;
+            }
+            after = urls.last().cloned();
+            for url in urls {
+                let canonical = normalize(&url)?;
+                if canonical != url {
+                    tx.execute(
+                        "DELETE FROM sync_seen WHERE account_id=?1 AND stream=?2 AND url=?3",
+                        params![account, stream, url],
+                    )
+                    .map_err(storage)?;
+                    tx.execute(
+                        "INSERT OR IGNORE INTO sync_seen(account_id,stream,url) VALUES(?1,?2,?3)",
+                        params![account, stream, canonical],
+                    )
+                    .map_err(storage)?;
+                }
+            }
+        }
+        tx.execute(
+            "UPDATE sync_cursors SET next_url=?3,delta_url=?4 WHERE account_id=?1 AND stream=?2",
+            params![account, stream, next, delta],
+        )
+        .map_err(storage)?;
+        let current = next.as_ref().or(delta.as_ref());
+        let repeated: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM sync_seen WHERE account_id=?1 AND stream=?2 AND url=?3)",params![account,stream,current],|r|r.get(0)).map_err(storage)?;
+        if repeated {
+            return Err(Error::new(
+                "invalid_graph_response",
+                "Graph returned a repeated synchronization continuation",
+            ));
+        }
+        tx.commit().map_err(storage)
+    }
     pub fn reset_cursor(
         &self,
         account: &str,
@@ -604,35 +706,61 @@ impl Db {
         next: Option<&str>,
         delta: Option<&str>,
     ) -> Result<()> {
-        if next.is_none() && delta.is_none() {
+        if next.is_some() == delta.is_some() || next.or(delta).is_some_and(str::is_empty) {
             return Err(Error::new(
                 "invalid_graph_response",
-                "Delta response lacks a continuation or delta link",
+                "Delta response requires exactly one nonempty continuation or delta link",
             ));
         }
         let mut conn = self.conn()?;
         let tx = conn.transaction().map_err(storage)?;
         fence(&tx, account, generation)?;
-        let rebuilding: bool = tx
-            .query_row(
-                "SELECT rebuilding FROM sync_cursors WHERE account_id=?1 AND stream=?2",
-                params![account, stream],
-                |r| r.get(0),
-            )
-            .map_err(storage)?;
+        let (rebuilding, current): (bool, String) = tx.query_row(
+            "SELECT rebuilding,COALESCE(next_url,delta_url) FROM sync_cursors WHERE account_id=?1 AND stream=?2",
+            params![account, stream], |r| Ok((r.get(0)?, r.get(1)?)),
+        ).map_err(storage)?;
+        if stream != "lists" && !stream.starts_with("tasks:") {
+            return Err(Error::new(
+                "invalid_sync_stream",
+                "Unknown synchronization stream",
+            ));
+        }
+        // Durable cycle detection spans page budgets and process restarts.
+        tx.execute(
+            "INSERT OR IGNORE INTO sync_seen(account_id,stream,url) VALUES(?1,?2,?3)",
+            params![account, stream, current],
+        )
+        .map_err(storage)?;
+        if let Some(next) = next {
+            let seen: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM sync_seen WHERE account_id=?1 AND stream=?2 AND url=?3)", params![account,stream,next], |r| r.get(0)).map_err(storage)?;
+            if seen {
+                return Err(Error::new(
+                    "invalid_graph_response",
+                    "Graph returned a repeated synchronization continuation",
+                ));
+            }
+        }
         for value in values {
             let id = entity_id(value)?;
             // A repeated delta ID may supply only changed fields; merge without erasing explicit nulls.
-            let old: Option<String> = tx
+            let old: Option<(String, bool)> = tx
                 .query_row(
-                    "SELECT data FROM sync_stage WHERE account_id=?1 AND stream=?2 AND id=?3",
+                    "SELECT data,reset_base FROM sync_stage WHERE account_id=?1 AND stream=?2 AND id=?3",
                     params![account, stream, id],
-                    |r| r.get(0),
+                    |r| Ok((r.get(0)?, r.get(1)?)),
                 )
                 .optional()
                 .map_err(storage)?;
-            let staged = merge_entity(old.map(parse).transpose()?, value);
-            tx.execute("INSERT INTO sync_stage(account_id,stream,id,data) VALUES(?1,?2,?3,?4) ON CONFLICT(account_id,stream,id) DO UPDATE SET data=excluded.data",params![account,stream,id,staged.to_string()]).map_err(storage)?;
+            let (old, reset_base) = match old {
+                Some((data, reset)) => {
+                    let old = parse(data)?;
+                    let reset = reset || old.get("@removed").is_some();
+                    (Some(old), reset)
+                }
+                None => (None, false),
+            };
+            let staged = merge_entity(old, value);
+            tx.execute("INSERT INTO sync_stage(account_id,stream,id,data,reset_base) VALUES(?1,?2,?3,?4,?5) ON CONFLICT(account_id,stream,id) DO UPDATE SET data=excluded.data,reset_base=excluded.reset_base",params![account,stream,id,staged.to_string(),reset_base]).map_err(storage)?;
         }
         if let Some(next) = next {
             tx.execute(
@@ -641,69 +769,69 @@ impl Db {
             )
             .map_err(storage)?;
         } else {
-            let staged: Vec<Value> = {
-                let mut stmt = tx
-                    .prepare(
-                        "SELECT data FROM sync_stage WHERE account_id=?1 AND stream=?2 ORDER BY id",
-                    )
-                    .map_err(storage)?;
-                stmt.query_map(params![account, stream], |r| r.get::<_, String>(0))
-                    .map_err(storage)?
-                    .map(|v| parse(v.map_err(storage)?))
-                    .collect::<Result<_>>()?
-            };
-            if stream == "lists" {
-                if rebuilding {
-                    let old: Vec<String> = {
-                        let mut stmt = tx
-                            .prepare("SELECT id FROM lists WHERE account_id=?1")
+            if rebuilding && stream == "lists" {
+                // Remove missing lists and their streams with indexed anti-joins, without
+                // loading the entire snapshot or doing a quadratic list comparison.
+                tx.execute(r#"DELETE FROM sync_cursors WHERE account_id=?1 AND stream IN (
+                    SELECT 'tasks:'||l.id FROM lists l WHERE l.account_id=?1 AND NOT EXISTS(
+                        SELECT 1 FROM sync_stage s WHERE s.account_id=l.account_id AND s.stream='lists'
+                        AND s.id=l.id AND json_type(s.data,'$."@removed"') IS NULL))"#, [account]).map_err(storage)?;
+                tx.execute(
+                    r#"DELETE FROM lists AS l WHERE account_id=?1 AND NOT EXISTS(
+                    SELECT 1 FROM sync_stage s WHERE s.account_id=l.account_id AND s.stream='lists'
+                    AND s.id=l.id AND json_type(s.data,'$."@removed"') IS NULL)"#,
+                    [account],
+                )
+                .map_err(storage)?;
+            } else if rebuilding && let Some(list) = stream.strip_prefix("tasks:") {
+                tx.execute(
+                    "DELETE FROM tasks WHERE account_id=?1 AND list_id=?2",
+                    params![account, list],
+                )
+                .map_err(storage)?;
+            }
+            // A resumed scan can span many pages. Publish one staged entity at a time.
+            {
+                let mut stmt = tx.prepare("SELECT data,reset_base FROM sync_stage WHERE account_id=?1 AND stream=?2 ORDER BY id").map_err(storage)?;
+                let mut rows = stmt.query(params![account, stream]).map_err(storage)?;
+                while let Some(row) = rows.next().map_err(storage)? {
+                    let value = parse(row.get(0).map_err(storage)?)?;
+                    let reset_base: bool = row.get(1).map_err(storage)?;
+                    let id = entity_id(&value)?;
+                    let removed = value.get("@removed").is_some();
+                    if stream == "lists" {
+                        if removed || reset_base {
+                            delete_list_tx(&tx, account, id)?;
+                        }
+                        if !removed {
+                            if rebuilding {
+                                tx.execute(
+                                    "UPDATE lists SET data=?3 WHERE account_id=?1 AND id=?2",
+                                    params![account, id, value.to_string()],
+                                )
+                                .map_err(storage)?;
+                            }
+                            put_list_tx(&tx, account, &value)?;
+                        }
+                    } else if let Some(list) = stream.strip_prefix("tasks:") {
+                        if removed || reset_base {
+                            tx.execute(
+                                "DELETE FROM tasks WHERE account_id=?1 AND list_id=?2 AND id=?3",
+                                params![account, list, id],
+                            )
                             .map_err(storage)?;
-                        stmt.query_map([account], |r| r.get(0))
-                            .map_err(storage)?
-                            .collect::<std::result::Result<_, _>>()
-                            .map_err(storage)?
-                    };
-                    for id in old {
-                        if !staged.iter().any(|v| {
-                            v.get("id").and_then(Value::as_str) == Some(id.as_str())
-                                && v.get("@removed").is_none()
-                        }) {
-                            delete_list_tx(&tx, account, &id)?;
+                        }
+                        if !removed {
+                            put_task_tx(&tx, account, list, &value)?;
                         }
                     }
                 }
-                for value in &staged {
-                    if value.get("@removed").is_some() {
-                        delete_list_tx(&tx, account, entity_id(value)?)?;
-                    } else {
-                        put_list_tx(&tx, account, value)?;
-                    }
-                }
-            } else if let Some(list) = stream.strip_prefix("tasks:") {
-                if rebuilding {
-                    tx.execute(
-                        "DELETE FROM tasks WHERE account_id=?1 AND list_id=?2",
-                        params![account, list],
-                    )
-                    .map_err(storage)?;
-                }
-                for value in &staged {
-                    if value.get("@removed").is_some() {
-                        tx.execute(
-                            "DELETE FROM tasks WHERE account_id=?1 AND list_id=?2 AND id=?3",
-                            params![account, list, entity_id(value)?],
-                        )
-                        .map_err(storage)?;
-                    } else {
-                        put_task_tx(&tx, account, list, value)?;
-                    }
-                }
-            } else {
-                return Err(Error::new(
-                    "invalid_sync_stream",
-                    "Unknown synchronization stream",
-                ));
             }
+            tx.execute(
+                "DELETE FROM sync_seen WHERE account_id=?1 AND stream=?2",
+                params![account, stream],
+            )
+            .map_err(storage)?;
             tx.execute(
                 "DELETE FROM sync_stage WHERE account_id=?1 AND stream=?2",
                 params![account, stream],
@@ -740,7 +868,7 @@ impl Db {
         fingerprint: &str,
         request: &Value,
     ) -> Result<Operation> {
-        if key.is_empty() || key.len() > 128 || fingerprint.is_empty() {
+        if key.is_empty() || key.chars().count() > 128 || fingerprint.is_empty() {
             return Err(Error::new(
                 "invalid_arguments",
                 "An operation_key of 1–128 characters is required",
@@ -1420,7 +1548,7 @@ mod tests {
         drop(db);
         let path = dir.path().join("test.db");
         let conn = Connection::open(&path).unwrap();
-        conn.execute_batch("DROP TRIGGER task_fts_insert;DROP TRIGGER task_fts_update;DROP TRIGGER task_fts_delete;DROP TABLE task_fts;PRAGMA user_version=1;").unwrap();
+        conn.execute_batch("DROP TRIGGER task_fts_insert;DROP TRIGGER task_fts_update;DROP TRIGGER task_fts_delete;DROP TABLE task_fts;ALTER TABLE sync_stage DROP COLUMN reset_base;DROP TABLE sync_seen;PRAGMA user_version=1;").unwrap();
         drop(conn);
         let db = Db::open(&path).unwrap();
         assert_eq!(
@@ -1447,5 +1575,319 @@ mod tests {
                 .unwrap(),
             99
         );
+    }
+    #[test]
+    fn second_open_cannot_recover_live_operations() {
+        let (dir, db, _) = setup();
+        db.operation_claim("a", "live", "fp", &Value::Null).unwrap();
+        assert!(
+            matches!(Db::open(&dir.path().join("test.db")), Err(Error { code, .. }) if code == "database_in_use")
+        );
+        assert_eq!(db.operation("a", "live").unwrap().state, "pending");
+        drop(db);
+        let db = Db::open(&dir.path().join("test.db")).unwrap();
+        assert_eq!(db.operation("a", "live").unwrap().state, "unknown");
+    }
+    #[test]
+    fn tombstone_resurrection_does_not_restore_deleted_task_fields() {
+        let (dir, db, a) = setup();
+        seed(&db, &a, "list", "task", "Old private title");
+        db.sync_cursor("a", a.generation, "tasks:list", "initial")
+            .unwrap();
+        db.apply_sync_page(
+            "a",
+            a.generation,
+            "tasks:list",
+            &[json!({"id":"task","title":"Old private title","body":{"content":"Old body"}})],
+            None,
+            Some("d1"),
+        )
+        .unwrap();
+        db.apply_sync_page(
+            "a",
+            a.generation,
+            "tasks:list",
+            &[json!({"id":"task","@removed":{}})],
+            Some("next"),
+            None,
+        )
+        .unwrap();
+        drop(db);
+        let db = Db::open(&dir.path().join("test.db")).unwrap();
+        db.apply_sync_page(
+            "a",
+            a.generation,
+            "tasks:list",
+            &[json!({"id":"task","title":"Recreated"})],
+            None,
+            Some("d2"),
+        )
+        .unwrap();
+        let task = db.task("a", "list", "task").unwrap();
+        assert_eq!(task["title"], "Recreated");
+        assert!(task.get("body").is_none());
+        assert!(
+            db.search(&SearchQuery {
+                text: "Old body".into(),
+                ..Default::default()
+            })
+            .unwrap()["tasks"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+    }
+    #[test]
+    fn list_resurrection_drops_old_tasks_and_task_cursor() {
+        let (_dir, db, a) = setup();
+        seed(&db, &a, "list", "task", "stale");
+        db.sync_cursor("a", a.generation, "tasks:list", "task-initial")
+            .unwrap();
+        db.sync_cursor("a", a.generation, "lists", "initial")
+            .unwrap();
+        db.apply_sync_page(
+            "a",
+            a.generation,
+            "lists",
+            &[json!({"id":"list"})],
+            None,
+            Some("d1"),
+        )
+        .unwrap();
+        db.apply_sync_page(
+            "a",
+            a.generation,
+            "lists",
+            &[
+                json!({"id":"list","@removed":{}}),
+                json!({"id":"list","displayName":"Fresh"}),
+            ],
+            None,
+            Some("d2"),
+        )
+        .unwrap();
+        assert!(db.tasks("a", "list").unwrap().is_empty());
+        assert_eq!(db.sync_status("a").unwrap()["pending_streams"], 0);
+    }
+    #[test]
+    fn repeated_cursor_is_rejected_across_restart_without_staging_bad_page() {
+        let (dir, db, a) = setup();
+        db.sync_cursor("a", a.generation, "lists", "initial")
+            .unwrap();
+        db.apply_sync_page(
+            "a",
+            a.generation,
+            "lists",
+            &[json!({"id":"one"})],
+            Some("page2"),
+            None,
+        )
+        .unwrap();
+        drop(db);
+        let db = Db::open(&dir.path().join("test.db")).unwrap();
+        assert_eq!(
+            db.apply_sync_page(
+                "a",
+                a.generation,
+                "lists",
+                &[json!({"id":"bad"})],
+                Some("initial"),
+                None
+            )
+            .unwrap_err()
+            .code,
+            "invalid_graph_response"
+        );
+        assert_eq!(
+            db.sync_cursor("a", a.generation, "lists", "initial")
+                .unwrap()
+                .url,
+            "page2"
+        );
+        db.apply_sync_page("a", a.generation, "lists", &[], None, Some("delta"))
+            .unwrap();
+        assert_eq!(db.lists("a").unwrap(), vec![json!({"id":"one"})]);
+        // An unchanged delta token is valid on separate completed polls.
+        db.apply_sync_page("a", a.generation, "lists", &[], None, Some("delta"))
+            .unwrap();
+    }
+    #[test]
+    fn full_list_rebuild_replaces_properties_but_retains_existing_tasks() {
+        let (_dir, db, a) = setup();
+        seed(&db, &a, "list", "task", "retained");
+        db.put_list(
+            "a",
+            a.generation,
+            &json!({"id":"list","staleProperty":"old"}),
+        )
+        .unwrap();
+        db.sync_cursor("a", a.generation, "lists", "initial")
+            .unwrap();
+        db.apply_sync_page(
+            "a",
+            a.generation,
+            "lists",
+            &[json!({"id":"list","displayName":"New"})],
+            None,
+            Some("d1"),
+        )
+        .unwrap();
+        assert!(db.lists("a").unwrap()[0].get("staleProperty").is_none());
+        assert!(db.task("a", "list", "task").is_ok());
+    }
+    #[test]
+    fn invalid_continuations_are_atomic() {
+        let (_dir, db, a) = setup();
+        db.sync_cursor("a", a.generation, "lists", "initial")
+            .unwrap();
+        for (next, delta) in [
+            (Some("next"), Some("delta")),
+            (Some(""), None),
+            (None, Some("")),
+        ] {
+            assert!(
+                db.apply_sync_page(
+                    "a",
+                    a.generation,
+                    "lists",
+                    &[json!({"id":"bad"})],
+                    next,
+                    delta
+                )
+                .is_err()
+            );
+        }
+        assert_eq!(
+            db.sync_cursor("a", a.generation, "lists", "initial")
+                .unwrap()
+                .url,
+            "initial"
+        );
+        db.apply_sync_page("a", a.generation, "lists", &[], None, Some("delta"))
+            .unwrap();
+        assert!(db.lists("a").unwrap().is_empty());
+    }
+    #[test]
+    fn failed_migration_rolls_back_recovery_and_schema() {
+        let (dir, db, a) = setup();
+        seed(&db, &a, "list", "task", "old");
+        db.operation_claim("a", "live", "fp", &Value::Null).unwrap();
+        drop(db);
+        let path = dir.path().join("test.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("UPDATE tasks SET data='invalid json'; ALTER TABLE sync_stage DROP COLUMN reset_base; DROP TABLE sync_seen; PRAGMA user_version=1;").unwrap();
+        drop(conn);
+        assert!(Db::open(&path).is_err());
+        let conn = Connection::open(&path).unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT state FROM operations WHERE operation_key='live'",
+                [],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+            "pending"
+        );
+        assert_eq!(
+            conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM sqlite_master WHERE name='sync_seen'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+    }
+    #[cfg(unix)]
+    #[test]
+    fn database_and_sidecars_are_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let (dir, db, _) = setup();
+        for name in ["test.db", "test.db-wal", "test.db-shm"] {
+            assert_eq!(
+                std::fs::metadata(dir.path().join(name))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600,
+                "{name}"
+            );
+        }
+        drop(db);
+    }
+
+    #[test]
+    fn ready_status_requires_published_streams_for_every_cached_list() {
+        let (_dir, db, a) = setup();
+        db.sync_cursor("a", a.generation, "lists", "initial")
+            .unwrap();
+        db.apply_sync_page("a", a.generation, "lists", &[], None, Some("delta"))
+            .unwrap();
+        db.set_sync_status("a", a.generation, "ready", None)
+            .unwrap();
+        assert_eq!(db.sync_status("a").unwrap()["complete"], true);
+        db.put_list("a", a.generation, &json!({"id":"new-list"}))
+            .unwrap();
+        assert_eq!(db.sync_status("a").unwrap()["complete"], false);
+        db.sync_cursor("a", a.generation, "tasks:new-list", "initial")
+            .unwrap();
+        db.apply_sync_page(
+            "a",
+            a.generation,
+            "tasks:new-list",
+            &[],
+            None,
+            Some("delta"),
+        )
+        .unwrap();
+        assert_eq!(db.sync_status("a").unwrap()["complete"], true);
+        db.apply_sync_page("a", a.generation, "tasks:new-list", &[], Some("next"), None)
+            .unwrap();
+        assert_eq!(db.sync_status("a").unwrap()["complete"], false);
+    }
+    #[test]
+    fn operation_keys_use_unicode_character_bounds() {
+        let (_dir, db, _) = setup();
+        assert!(
+            db.operation_claim("a", &"中".repeat(128), "fp", &Value::Null)
+                .unwrap()
+                .created
+        );
+        assert_eq!(
+            db.operation_claim("a", &"中".repeat(129), "fp", &Value::Null)
+                .unwrap_err()
+                .code,
+            "invalid_arguments"
+        );
+    }
+    #[test]
+    fn database_lock_probe() {
+        if let Some(path) = std::env::var_os("TODO_MCP_TEST_LOCK_PATH") {
+            assert!(
+                matches!(Db::open(Path::new(&path)),Err(Error { code, .. }) if code == "database_in_use")
+            );
+        }
+    }
+    #[test]
+    fn another_process_cannot_open_the_live_database() {
+        let (dir, db, _) = setup();
+        db.operation_claim("a", "live", "fp", &Value::Null).unwrap();
+        let result = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "db::tests::database_lock_probe"])
+            .env("TODO_MCP_TEST_LOCK_PATH", dir.path().join("test.db"))
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stdout)
+        );
+        assert_eq!(db.operation("a", "live").unwrap().state, "pending");
     }
 }

@@ -51,18 +51,18 @@ impl Config {
             .filter(|s| !s.is_empty())
             .cloned();
         if let Some(token) = &dev_mcp_token
-            && (!bind.ip().is_loopback() || !is_loopback(&url) || token.len() < 32)
+            && (!bind.ip().is_loopback() || !is_loopback(&url) || !valid_bearer_secret(token))
         {
             return Err(Error::new(
                 "configuration",
-                "Development MCP tokens require loopback bind/public URL and at least 32 characters",
+                "Development MCP tokens require loopback bind/public URL and a 32–16377 character visible ASCII token without whitespace",
             ));
         }
         let admin_token = required("TODO_ADMIN_TOKEN")?;
-        if admin_token.len() < 32 || admin_token.starts_with("replace-with-") {
+        if !valid_bearer_secret(&admin_token) || admin_token.starts_with("replace-with-") {
             return Err(Error::new(
                 "configuration",
-                "TODO_ADMIN_TOKEN requires at least 32 random characters",
+                "TODO_ADMIN_TOKEN requires 32–16377 random visible ASCII characters without whitespace",
             ));
         }
         if dev_mcp_token.as_ref() == Some(&admin_token) {
@@ -90,29 +90,31 @@ impl Config {
             ));
         }
         let microsoft_client_id = required("MICROSOFT_CLIENT_ID")?;
-        uuid::Uuid::parse_str(&microsoft_client_id).map_err(|_| {
+        let microsoft_client_id = uuid::Uuid::parse_str(&microsoft_client_id).map_err(|_| {
             Error::new(
                 "configuration",
                 "MICROSOFT_CLIENT_ID must be an application UUID",
             )
         })?;
-        if uuid::Uuid::parse_str(&microsoft_client_id).is_ok_and(|id| id.is_nil()) {
+        if microsoft_client_id.is_nil() {
             return Err(Error::new(
                 "configuration",
                 "Replace the sample MICROSOFT_CLIENT_ID with your registered application UUID",
             ));
         }
+        let microsoft_client_id = microsoft_client_id.to_string();
         let microsoft_tenant = get("MICROSOFT_TENANT", "common");
-        if !matches!(
+        let microsoft_tenant = if matches!(
             microsoft_tenant.as_str(),
             "common" | "organizations" | "consumers"
-        ) && uuid::Uuid::parse_str(&microsoft_tenant).is_err()
-        {
-            return Err(Error::new(
+        ) {
+            microsoft_tenant
+        } else {
+            uuid::Uuid::parse_str(&microsoft_tenant).map_err(|_| Error::new(
                 "configuration",
                 "MICROSOFT_TENANT must be common, organizations, consumers, or a tenant UUID",
-            ));
-        }
+            ))?.to_string()
+        };
         let sync_interval_secs = get("TODO_SYNC_INTERVAL_SECS", "60")
             .parse::<u64>()
             .map_err(|_| {
@@ -186,6 +188,10 @@ impl Config {
         })
     }
 }
+fn valid_bearer_secret(token: &str) -> bool {
+    // The shared HTTP parser bounds the entire "Bearer <token>" header to 16 KiB.
+    (32..=16 * 1024 - 7).contains(&token.len()) && token.bytes().all(|b| b.is_ascii_graphic())
+}
 fn is_loopback(url: &Url) -> bool {
     matches!(
         url.host_str(),
@@ -232,6 +238,41 @@ mod tests {
         .into_iter()
         .map(|(k, v)| (k.into(), v.into()))
         .collect()
+    }
+    #[test]
+    fn canonicalizes_uuid_configuration_before_constructing_authority_urls() {
+        let mut e = env();
+        e.insert(
+            "MICROSOFT_CLIENT_ID".into(),
+            "urn:uuid:00000000-0000-0000-0000-000000000001".into(),
+        );
+        e.insert(
+            "MICROSOFT_TENANT".into(),
+            "{00000000-0000-0000-0000-000000000002}".into(),
+        );
+        let config = Config::parse(&e).unwrap();
+        assert_eq!(
+            config.microsoft_client_id,
+            "00000000-0000-0000-0000-000000000001"
+        );
+        assert_eq!(
+            config.microsoft_tenant,
+            "00000000-0000-0000-0000-000000000002"
+        );
+    }
+    #[test]
+    fn rejects_secrets_that_cannot_be_used_in_bearer_headers() {
+        for key in ["TODO_ADMIN_TOKEN", "TODO_DEV_MCP_TOKEN"] {
+            for invalid in [
+                "with space".repeat(5),
+                "中文".repeat(20),
+                "x".repeat(16 * 1024),
+            ] {
+                let mut e = env();
+                e.insert(key.into(), invalid);
+                assert!(Config::parse(&e).is_err(), "accepted unusable {key}");
+            }
+        }
     }
     #[test]
     fn development_is_loopback_only() {

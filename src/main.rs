@@ -3,11 +3,11 @@ use rust_microsoft_todo_mcp::{
     config::Config,
     db::Db,
     graph::GraphClient,
-    server::{StateData, router},
+    server::{StateData, WorkTracker, router_with_tracker},
     sync::Sync,
     tools::Tools,
 };
-use std::sync::Arc;
+use std::{future::IntoFuture, sync::Arc, time::Duration};
 use tokio_util::sync::CancellationToken;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -42,13 +42,28 @@ async fn main() -> anyhow::Result<()> {
     let background = tokio::spawn(sync.run(config.sync_interval_secs));
     let listener = tokio::net::TcpListener::bind(config.bind).await?;
     tracing::info!(address=%config.bind,"Microsoft To Do MCP listening");
+    let work = WorkTracker::new();
     let stop = shutdown.clone();
-    axum::serve(listener, router(state, shutdown))
-        .with_graceful_shutdown(async move {
-            shutdown_signal().await;
-            stop.cancel();
-        })
-        .await?;
+    let server = axum::serve(
+        listener,
+        router_with_tracker(state, shutdown.clone(), work.clone()),
+    )
+    .with_graceful_shutdown(stop.cancelled_owned())
+    .into_future();
+    tokio::pin!(server);
+    tokio::select! {
+        result=&mut server=>{result?;},
+        _=shutdown_signal()=>{
+            work.close();shutdown.cancel();
+            match tokio::time::timeout(Duration::from_secs(30),&mut server).await {
+                Ok(result) => result?,
+                Err(_) => tracing::warn!("HTTP shutdown deadline reached; draining admitted work"),
+            }
+        }
+    }
+    if !work.drain(Duration::from_secs(10)).await {
+        tracing::warn!("Tool shutdown deadline reached; unfinished writes will recover as unknown");
+    }
     background.abort();
     Ok(())
 }

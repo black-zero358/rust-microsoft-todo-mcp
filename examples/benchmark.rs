@@ -8,10 +8,14 @@ fn main() -> anyhow::Result<()> {
     let db = Db::open(&dir.path().join("benchmark.db"))?;
     let open_ms = started.elapsed().as_secs_f64() * 1000.;
     let a = db.upsert_account("synthetic", "Synthetic account", "not-a-real-token")?;
-    db.put_list(
+    db.sync_cursor(&a.id, a.generation, "lists", "initial-lists")?;
+    db.apply_sync_page(
         &a.id,
         a.generation,
-        &json!({"id":"list","displayName":"Synthetic"}),
+        "lists",
+        &[json!({"id":"list","displayName":"Synthetic"})],
+        None,
+        Some("final-lists"),
     )?;
     db.sync_cursor(&a.id, a.generation, "tasks:list", "initial")?;
     let records:Vec<_>=(0..10_000).map(|i|json!({"id":format!("task-{i:05}"),"title":format!("中文任务 Project {i}"),"body":{"contentType":"html","content":format!("<p>项目检查与交付 item {i}</p>")},"status":"notStarted"})).collect();
