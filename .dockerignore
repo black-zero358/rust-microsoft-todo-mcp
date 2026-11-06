@@ -4,3 +4,5 @@
 !rust-toolchain.toml
 !src/
 !src/**
+!LICENSE
+!THIRD_PARTY_NOTICES.md

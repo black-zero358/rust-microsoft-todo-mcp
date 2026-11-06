@@ -50,4 +50,4 @@ Live acceptance still requires the operator's deployment and consent:
 3. Live list/task/step/link CRUD, reminder and recurrence behavior, nullable field clearing, and phone-to-cache delta updates.
 4. Restart with real authorization and two-account isolation/disconnect.
 
-Use the dedicated disposable-list procedure in [deployment](deployment.md). M1 remains an implementation candidate until these live checks pass. Attachment tools are M2. License selection awaits the project owner's decision.
+Use the dedicated disposable-list procedure in [deployment](deployment.md). M1 remains an implementation candidate until these live checks pass. Attachment tools are M2. The project owner selected AGPL-3.0-only; see [LICENSE](../LICENSE).

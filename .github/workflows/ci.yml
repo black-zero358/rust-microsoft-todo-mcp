@@ -35,5 +35,8 @@ jobs:
             if curl --fail --silent http://127.0.0.1:18080/healthz; then break; fi
             sleep 1
           done
+          docker exec todo-smoke test -s /usr/share/licenses/rust-microsoft-todo-mcp/LICENSE
+          docker exec todo-smoke test -s /usr/share/licenses/rust-microsoft-todo-mcp/third-party/rust/COPYRIGHT-library.html
+          docker exec todo-smoke sh -c 'test -n "$(find /usr/share/licenses/rust-microsoft-todo-mcp/third-party/crates -type f -print -quit)"'
           curl --fail --silent http://127.0.0.1:18080/healthz
           test "$(curl --silent -o /dev/null -w '%{http_code}' http://127.0.0.1:18080/mcp)" = 401
