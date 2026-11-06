@@ -1,45 +1,50 @@
-# rust-microsoft-todo-mcp
+# Rust Microsoft To Do MCP
 
-A Rust-based Microsoft To Do MCP server focused on complete task management, incremental synchronization, and efficient agent workflows.
+A self-hosted Rust MCP server for Microsoft To Do, designed for a personal VPS and one or more Microsoft accounts. **M1 implementation candidate:** Streamable HTTP, separate client and Microsoft authorization, persistent cache, Chinese search, background delta sync, and task/list/checklist/link management. Attachments are planned for M2.
 
-**Status: M1 scope agreed; implementation pending.**
+[Deployment](docs/deployment.md) · [Authentication](docs/authentication.md) · [Architecture](docs/architecture.md) · [Validation](docs/validation.md) · [M1 agreement](docs/M1-SPEC.md)
 
-## 项目定位
+## Quick start
 
-面向个人自托管的远程 Microsoft To Do MCP 服务，部署在 VPS / Docker，供 ChatGPT 等客户端连接。使用 Rust 实现，以 [Softeria/ms-365-mcp-server](https://github.com/Softeria/ms-365-mcp-server) 的 To Do 能力为功能参考，优化实现并补全任务工作流。
+You need Docker Compose, a public HTTPS domain, a Microsoft application registration, and an OAuth provider that issues RS256 access tokens. The MCP service validates the owner's subject, issuer, resource audience and scope on every request. Your Microsoft accounts are authorized separately using device sign-in.
 
-## 已确认的方案
+1. Clone this repository and copy `.env.example` to `.env`.
+2. Follow [authentication setup](docs/authentication.md) to configure your Microsoft Client ID and the MCP OAuth provider. Generate separate administrator and encryption secrets. Keep `.env` private.
+3. Run `docker compose up -d --build`. The container exposes port 8080 on the VPS loopback interface only.
+4. Put HTTPS in front using the [Caddy example](deploy/Caddyfile).
+5. Open `https://todo.example.com/admin`, enter your administrator token, add a Microsoft account, and synchronize it.
+6. Connect the MCP client to `https://todo.example.com/mcp` with OAuth. Start with `list_accounts`, `list_lists`, and `search_tasks`.
 
-- Streamable HTTP 远程接入，提供 HTTPS 部署说明及客户端认证。
-- 管理自己的一个或多个微软账户，支持默认账户及数据隔离。
-- 本地持久化任务正文、搜索索引及同步状态；后台增量同步。
-- 部署者自备 Microsoft 应用注册和 Client ID，提供逐步配置文档。
-- 轻量管理页面：添加账户、查看同步状态、撤销授权。
+See [deployment and acceptance](docs/deployment.md) for the complete steps and live Microsoft/ChatGPT checks.
 
-## M1：首个可用版本（待实现）
+## Tools
 
-- 清单与任务完整管理，包括正文、重要性、分类、截止日期、提醒和重复规则。
-- 步骤／检查项及关联资源的增删改查。
-- 中文标题与正文搜索，跨清单／跨账户搜索及结构化筛选。
-- 首次全量同步、清单与任务 Delta、手动刷新、同步状态及中断恢复。
-- Docker 与持久化卷、账户授权刷新、分页、限流退避、写入超时核对和日志脱敏。
+| Area | Tools |
+| --- | --- |
+| Accounts and cache | `list_accounts`, `sync_status`, `refresh`, `search_tasks` |
+| Lists | `list_lists`, `get_list`, `create_list`, `update_list`, `delete_list` |
+| Tasks | `list_tasks`, `get_task`, `create_task`, `update_task`, `delete_task`, `complete_task`, `reopen_task` |
+| Steps | `list_steps`, `create_step`, `update_step`, `delete_step` |
+| Links | `list_linked_resources`, `create_linked_resource`, `update_linked_resource`, `delete_linked_resource` |
+| Write recovery | `get_operation`, `reconcile_operation` |
 
-完整范围、设计基线及验收场景见 **[M1 项目共识与验收标准](docs/M1-SPEC.md)**。
+Task input covers title, body, importance, categories, status, due/start dates, reminders and recurrence. Omit a field to preserve it; send `null` for supported nullable fields to clear it. Dates use Graph's `dateTime` and `timeZone` objects. Plain-text bodies are escaped and sent as HTML for Graph compatibility. See [Graph contracts](docs/graph-contract.md).
 
-## M2
+Reads use the default account unless you specify one. Writes always require an explicit `account_id` and a new `operation_key` for each intended change. Retry the same intent with the **same key**. An uncertain write is stored as `unknown`; inspect and reconcile it before doing anything else. Creates with uncertain outcomes return matching candidates for review and are never automatically replayed.
 
-附件列出、上传、下载、删除、分块上传恢复，以及批量工作流和进一步的性能与恢复测试。
+Search reads the local cache, including Chinese title and body text, and supports account/list/status/due-date filters. Results include freshness and pagination. `get_task`, `get_list`, steps and links read Graph directly. `refresh` brings the selected account's cache up to date.
 
-## 性能目标
+## Development
 
-测量启动时间、内存、搜索延迟、Graph 请求次数及工具响应体积；具体指标随测试环境和工作负载确定。
+The toolchain is pinned to Rust 1.99.1. Tests use synthetic local HTTP services and temporary SQLite databases.
 
-## References
+```sh
+cargo fmt --all -- --check
+cargo clippy --all-targets --locked -- -D warnings
+cargo test --locked
+cargo build --release --locked
+```
 
-- [Reference endpoint definitions](https://github.com/Softeria/ms-365-mcp-server/blob/main/src/endpoints.json)
-- [Microsoft To Do API](https://learn.microsoft.com/en-us/graph/api/resources/todo-overview?view=graph-rest-1.0)
-- [Task delta](https://learn.microsoft.com/en-us/graph/api/todotask-delta?view=graph-rest-1.0)
-- [Linked resource update](https://learn.microsoft.com/en-us/graph/api/linkedresource-update?view=graph-rest-1.0)
-- [Attachment upload session](https://learn.microsoft.com/en-us/graph/api/taskfileattachment-createuploadsession?view=graph-rest-1.0)
+Production credential setup, connecting real Microsoft accounts and deployment remain operator actions. See [the validation ledger](docs/validation.md) for the exact checks performed on this implementation.
 
-许可证待定。
+License choice is pending project-owner confirmation. Design lessons were drawn from [rust-email-mcp](https://github.com/black-zero358/rust-email-mcp); this implementation uses Graph-specific transport, synchronization and operation contracts.
