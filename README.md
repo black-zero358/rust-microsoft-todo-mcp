@@ -42,6 +42,7 @@ The toolchain is pinned to Rust 1.99.1. Tests use synthetic local HTTP services 
 cargo fmt --all -- --check
 cargo clippy --all-targets --locked -- -D warnings
 cargo test --locked
+node --test scripts/admin-tests.cjs
 cargo build --release --locked
 ```
 

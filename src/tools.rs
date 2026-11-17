@@ -75,7 +75,7 @@ pub fn catalog() -> Vec<rmcp::model::Tool> {
     add(
         "search_tasks",
         "Search cached Chinese/English titles and bodies. Explicit account_ids selects cross-account scope; omitted uses default. Inspect freshness and pagination.",
-        json!({"account_ids":{"type":"array","minItems":1,"maxItems":16,"items":string()},"list_ids":{"type":"array","maxItems":100,"items":string()},"text":{"type":"string","maxLength":1024},"status":{"enum":["notStarted","inProgress","completed","waitingOnOthers","deferred"]},"due_from":{"type":"string","maxLength":10},"due_to":{"type":"string","maxLength":10},"limit":{"type":"integer","minimum":1,"maximum":100},"offset":{"type":"integer","minimum":0,"maximum":1000000}}),
+        json!({"account_ids":{"type":"array","minItems":1,"maxItems":16,"items":string()},"list_ids":{"type":"array","maxItems":100,"items":string()},"text":{"type":"string","maxLength":1024},"status":{"enum":["notStarted","inProgress","completed","waitingOnOthers","deferred"]},"due_from":{"type":"string","maxLength":10},"due_to":{"type":"string","maxLength":10},"limit":{"type":"integer","minimum":1,"maximum":100},"offset":{"type":"integer","minimum":0,"maximum":100000}}),
         &[],
         false,
         false,
@@ -860,6 +860,16 @@ mod tests {
         let observed = json!({"title":"task","body":{"contentType":"html","content":"<html><body>hello</body></html>"},"dueDateTime":{"dateTime":"2026-11-06T00:00:00.0000000","timeZone":"UTC"}});
         assert!(matches_create_candidate(&observed, &requested));
         assert!(!matches_patch(&observed, &requested));
+    }
+    #[test]
+    fn search_schema_matches_database_offset_limit() {
+        let tool = catalog()
+            .into_iter()
+            .find(|tool| tool.name == "search_tasks")
+            .unwrap();
+        let schema = serde_json::to_value(tool.input_schema).unwrap();
+        assert!(validate(&json!({"offset":100_000}), &schema));
+        assert!(!validate(&json!({"offset":100_001}), &schema));
     }
     #[test]
     fn schema_string_lengths_count_unicode_characters() {
