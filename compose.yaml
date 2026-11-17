@@ -1,0 +1,20 @@
+services:
+  todo:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      TODO_BIND: 0.0.0.0:8080
+      TODO_DATA_DIR: /data
+    volumes:
+      - todo-data:/data
+    ports:
+      - "127.0.0.1:8080:8080"
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,noexec,nosuid
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    stop_grace_period: 45s
+volumes:
+  todo-data:

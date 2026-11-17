@@ -1,0 +1,4 @@
+# Replace with the public DNS name pointing to this VPS.
+todo.example.com {
+    reverse_proxy 127.0.0.1:8080
+}
