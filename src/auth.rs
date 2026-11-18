@@ -58,8 +58,8 @@ struct AccessToken {
 struct VerifiedClaims {
     #[serde(flatten)]
     identity: Claims,
-    // jsonwebtoken also accepts array issuers and ignores malformed optional nbf.
-    // Keep its signature/time checks, but enforce these claim shapes ourselves.
+    // Keep explicit claim shapes at the application boundary in addition to
+    // jsonwebtoken's signature, timestamp, and registered-claim validation.
     #[serde(rename = "iss")]
     _issuer: String,
     #[serde(default, rename = "nbf", deserialize_with = "optional_numeric_date")]
@@ -826,8 +826,19 @@ CQnO+yVTmDvAoQEBRe9YRHE=
         scp.as_object_mut().unwrap().remove("scope");
         scp["scp"] = json!("todo:mcp");
         assert!(auth.verify_bearer(&signed(&scp)).await.is_ok());
+        let mut multi_audience = claims.clone();
+        multi_audience["aud"] = json!(["another-resource", "https://todo.example.com/mcp"]);
+        assert!(auth.verify_bearer(&signed(&multi_audience)).await.is_ok());
         for (field, value) in [
             ("sub", json!("other")),
+            ("sub", json!(["owner"])),
+            ("sub", json!(null)),
+            ("iss", json!(null)),
+            ("aud", json!(null)),
+            ("aud", json!(["https://todo.example.com/mcp", 7])),
+            ("exp", json!("not-a-timestamp")),
+            ("exp", json!(null)),
+            ("exp", json!(-1)),
             ("iss", json!("https://other.example.com")),
             (
                 "iss",
@@ -848,13 +859,24 @@ CQnO+yVTmDvAoQEBRe9YRHE=
                 "accepted invalid {field}"
             );
         }
-        let mut missing = claims.clone();
-        missing.as_object_mut().unwrap().remove("exp");
-        assert!(auth.verify_bearer(&signed(&missing)).await.is_err());
+        for field in ["exp", "iss", "aud", "sub"] {
+            let mut missing = claims.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            assert!(auth.verify_bearer(&signed(&missing)).await.is_err());
+        }
+        let mut unknown_key = Header::new(Algorithm::RS256);
+        unknown_key.kid = Some("unknown-key".into());
+        let token = encode(
+            &unknown_key,
+            &claims,
+            &EncodingKey::from_rsa_pem(TEST_KEY.as_bytes()).unwrap(),
+        )
+        .unwrap();
+        assert!(auth.verify_bearer(&token).await.is_err());
         let hs = encode(
             &Header::new(Algorithm::HS256),
             &claims,
-            &EncodingKey::from_secret(b"synthetic"),
+            &EncodingKey::from_secret(b"synthetic").unwrap(),
         )
         .unwrap();
         assert!(auth.verify_bearer(&hs).await.is_err());
