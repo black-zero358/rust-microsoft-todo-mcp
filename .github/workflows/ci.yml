@@ -20,6 +20,9 @@ jobs:
           node-version: 22
       - run: node --test scripts/admin-tests.cjs
       - run: cargo test --locked
+      # Development-token smoke bypasses JWT verification; exercise the real
+      # signed-token path with the release profile as a separate regression gate.
+      - run: cargo test --release --locked auth::jwt_tests::full_bearer_path_verifies_signature_expiry_issuer_resource_owner_scope -- --exact
       - run: cargo build --release --locked
       - run: docker build -t todo-mcp:ci .
       - run: python3 scripts/smoke.py
